@@ -18,6 +18,7 @@ Important current assumption:
 from __future__ import annotations
 
 import html
+import numpy as np
 from pathlib import Path
 import sys
 
@@ -31,6 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
+import src.analytics.exposure as exposure_module
 from src.analytics.portfolio import (
     build_current_portfolio_snapshot,
     summarize_total_portfolio,
@@ -48,6 +50,7 @@ from src.data.price_fetcher import (
     fetch_sp500_sector_group_weights,
 )
 from src.db.crud import (
+    get_latest_position_state_date,
     load_all_portfolio_snapshots,
     load_cash_ledger,
     load_position_state,
@@ -55,6 +58,7 @@ from src.db.crud import (
 )
 from src.db.session import session_scope
 from src.analytics.ledger import apply_cash_ledger_entries_to_positions, apply_trades_to_positions
+from src.utils.ui import apply_app_theme, render_page_title, render_top_nav
 
 
 COL_DATE = "as_of_date"
@@ -69,6 +73,14 @@ COL_WEIGHT = "weight"
 BENCHMARK_TICKERS = {
     "S&P 500": "SPY",
     "Nasdaq": "QQQ",
+}
+TEAM_BENCHMARK_TICKERS = {
+    "Consumer": "XLY",
+    "E&U": "XLU",
+    "F&R": "XLF",
+    "Healthcare": "XLV",
+    "TMT": "XLK",
+    "M&I": "XLI",
 }
 TEAM_COLORS = {
     "Consumer": "#C6D4FF",
@@ -115,6 +127,24 @@ def apply_page_theme() -> None:
     st.markdown(
         """
         <style>
+        div[data-testid="stTabs"] [data-baseweb="tab-list"] {
+            gap: 0.8rem;
+        }
+
+        div[data-testid="stTabs"] button[role="tab"] {
+            color: rgba(226, 232, 240, 0.74);
+        }
+
+        div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+            color: #DBEAFE;
+        }
+
+        div[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+            background: linear-gradient(135deg, rgba(20, 52, 110, 0.98), rgba(29, 78, 216, 0.94)) !important;
+            height: 0.2rem !important;
+            border-radius: 999px !important;
+        }
+
         .live-portfolio-card {
             background: linear-gradient(135deg, rgba(14, 116, 144, 0.14), rgba(59, 130, 246, 0.18));
             border: 1px solid rgba(14, 116, 144, 0.22);
@@ -175,11 +205,6 @@ def apply_page_theme() -> None:
 
         h3, h4 {
             letter-spacing: 0.01em;
-        }
-
-        .block-container {
-            padding-top: 2rem;
-            padding-bottom: 2rem;
         }
 
         html[data-theme="dark"] .live-portfolio-card-label,
@@ -281,6 +306,14 @@ def _prepare_master_performance_history(history_df: pd.DataFrame) -> pd.DataFram
     )
 
 
+def _prepare_team_performance_history(history_df: pd.DataFrame) -> pd.DataFrame:
+    return prepare_flow_adjusted_history(
+        history_df=history_df,
+        value_column="team_aum",
+        flow_column="net_external_flow",
+    )
+
+
 def _build_portfolio_return_series(history_df: pd.DataFrame) -> pd.Series:
     """
     Convert portfolio AUM history into a flow-adjusted daily return series.
@@ -289,6 +322,16 @@ def _build_portfolio_return_series(history_df: pd.DataFrame) -> pd.Series:
     if prepared.empty or "performance_return" not in prepared.columns:
         return pd.Series(dtype="float64")
     return pd.to_numeric(prepared["performance_return"], errors="coerce").dropna()
+
+
+@st.cache_data(ttl=settings.price_refresh_interval_seconds)
+def get_factor_analytics(snapshot_df: pd.DataFrame):
+    builder = getattr(
+        exposure_module,
+        "build_factor_analytics_platform",
+        getattr(exposure_module, "build_custom_live_factor_model"),
+    )
+    return builder(snapshot_df)
 
 
 def _is_cash_like_row(row: pd.Series) -> bool:
@@ -446,16 +489,47 @@ def _compute_one_year_portfolio_turnover(history_df: pd.DataFrame) -> float | No
 @st.cache_data(ttl=settings.price_refresh_interval_seconds)
 def get_master_fund_snapshot() -> pd.DataFrame:
     """
-    Load reconstructed latest position state and attach latest prices.
+    Load the latest reconstructed position state, carry it forward with any
+    later trades/cash flows, and then attach live prices.
     """
     with session_scope() as session:
-        position_state_df = load_position_state(session)
+        latest_state_date = get_latest_position_state_date(session)
+        position_state_df = load_position_state(session, as_of_date=latest_state_date)
+        trades_df = pd.DataFrame()
+        cash_df = pd.DataFrame()
+
+        if latest_state_date is not None:
+            start_date = pd.to_datetime(latest_state_date) + pd.Timedelta(days=1)
+            end_date = pd.Timestamp.today().normalize().date()
+            trades_df = load_trade_receipts(
+                session=session,
+                start_date=start_date.date(),
+                end_date=end_date,
+            )
+            cash_df = load_cash_ledger(
+                session=session,
+                start_date=start_date.date(),
+                end_date=end_date,
+            )
 
     if position_state_df.empty:
         return pd.DataFrame()
 
+    carried_positions_df = position_state_df.copy()
+    if not trades_df.empty:
+        carried_positions_df, _ = apply_trades_to_positions(
+            base_positions_df=carried_positions_df,
+            trades_df=trades_df,
+        )
+
+    if not cash_df.empty:
+        carried_positions_df = apply_cash_ledger_entries_to_positions(
+            positions_df=carried_positions_df,
+            cash_entries_df=cash_df,
+        )
+
     tickers = (
-        position_state_df[COL_TICKER]
+        carried_positions_df[COL_TICKER]
         .dropna()
         .astype(str)
         .str.strip()
@@ -465,7 +539,7 @@ def get_master_fund_snapshot() -> pd.DataFrame:
     )
 
     latest_prices_df, _ = fetch_latest_prices(tickers)
-    snapshot_df = build_current_portfolio_snapshot(position_state_df, latest_prices_df)
+    snapshot_df = build_current_portfolio_snapshot(carried_positions_df, latest_prices_df)
 
     return snapshot_df
 
@@ -571,6 +645,255 @@ def _build_price_matrix(
         .reindex(business_dates)
         .ffill()
     )
+
+
+def _build_team_history(team: str, snapshots_df: pd.DataFrame, benchmark_ticker: str) -> pd.DataFrame:
+    if snapshots_df.empty:
+        return pd.DataFrame(columns=["date", "team_aum", "net_external_flow", "benchmark_aum"])
+
+    with session_scope() as session:
+        trades_df = load_trade_receipts(session, team=team)
+        cash_df = load_cash_ledger(session, team=team)
+
+    df = snapshots_df.copy()
+    df["snapshot_date"] = pd.to_datetime(df["snapshot_date"], errors="coerce")
+    df[COL_TEAM] = df[COL_TEAM].astype(str).str.strip()
+    df[COL_TICKER] = df[COL_TICKER].astype(str).str.strip().str.upper()
+    df[COL_POSITION_SIDE] = df[COL_POSITION_SIDE].astype(str).str.strip().str.upper()
+    df[COL_SHARES] = pd.to_numeric(df[COL_SHARES], errors="coerce")
+    df = df.dropna(subset=["snapshot_date", COL_TICKER, COL_SHARES]).copy()
+    df = df.loc[df[COL_TEAM] == team].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["date", "team_aum", "net_external_flow", "benchmark_aum"])
+
+    today = pd.Timestamp.today().normalize()
+    oldest_snapshot_date = df["snapshot_date"].min().normalize()
+    start_date = max(oldest_snapshot_date, today - pd.Timedelta(days=372))
+    business_dates = pd.bdate_range(start=start_date, end=today)
+    if len(business_dates) == 0:
+        return pd.DataFrame(columns=["date", "team_aum", "net_external_flow", "benchmark_aum"])
+
+    ticker_normalization = {"BRKB": "BRK-B", "BRKA": "BRK-A"}
+    df[COL_TICKER] = df[COL_TICKER].replace(ticker_normalization)
+
+    trades = trades_df.copy()
+    if not trades.empty:
+        trades["trade_date"] = pd.to_datetime(trades["trade_date"], errors="coerce")
+        trades[COL_TICKER] = trades[COL_TICKER].astype(str).str.strip().str.upper().replace(ticker_normalization)
+        trades = trades.dropna(subset=["trade_date", COL_TICKER]).copy()
+
+    external_cash = cash_df.copy()
+    if not external_cash.empty:
+        external_cash["activity_date"] = pd.to_datetime(external_cash["activity_date"], errors="coerce")
+        external_cash["activity_type"] = external_cash["activity_type"].astype(str).str.strip().str.upper()
+        external_cash["amount"] = pd.to_numeric(external_cash["amount"], errors="coerce").fillna(0.0)
+        external_cash = external_cash.loc[
+            external_cash["activity_type"].isin(EXTERNAL_FLOW_ACTIVITY_TYPES)
+        ].dropna(subset=["activity_date"]).copy()
+
+    investable_tickers = (
+        df[COL_TICKER]
+        .loc[~_cash_like_mask(df)]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    trade_tickers = trades[COL_TICKER].dropna().unique().tolist() if not trades.empty else []
+    history_tickers = sorted(set(investable_tickers + trade_tickers + ([benchmark_ticker] if benchmark_ticker else [])))
+    raw_price_history = fetch_multiple_price_histories(history_tickers, lookback_days=(today - start_date).days + 30)
+    price_matrix = _build_price_matrix(raw_price_history, business_dates)
+
+    snapshot_by_date = {
+        dt.normalize(): grp.copy()
+        for dt, grp in df.groupby("snapshot_date")
+    }
+    snapshot_dates = sorted(snapshot_by_date.keys())
+    trades_by_date = {
+        dt.normalize(): grp.copy()
+        for dt, grp in trades.groupby(trades["trade_date"].dt.normalize())
+    } if not trades.empty else {}
+    cash_by_date = {
+        dt.normalize(): grp.copy()
+        for dt, grp in external_cash.groupby(external_cash["activity_date"].dt.normalize())
+    } if not external_cash.empty else {}
+
+    rows = []
+    active_positions_df: pd.DataFrame | None = None
+
+    for dt in business_dates:
+        net_external_flow = 0.0
+        snapshot_for_day = snapshot_by_date.get(dt.normalize())
+
+        if snapshot_for_day is not None:
+            active_positions_df = snapshot_for_day.copy()
+        else:
+            if active_positions_df is None:
+                eligible = [d for d in snapshot_dates if d <= dt]
+                if not eligible:
+                    continue
+                active_positions_df = snapshot_by_date[eligible[-1]].copy()
+
+            trades_today = trades_by_date.get(dt.normalize())
+            if trades_today is not None and not trades_today.empty:
+                active_positions_df, _ = apply_trades_to_positions(
+                    base_positions_df=active_positions_df,
+                    trades_df=trades_today,
+                )
+
+        cash_today = cash_by_date.get(dt.normalize())
+        if cash_today is not None and not cash_today.empty:
+            net_external_flow = float(pd.to_numeric(cash_today["amount"], errors="coerce").fillna(0.0).sum())
+            if snapshot_for_day is None and active_positions_df is not None:
+                active_positions_df = apply_cash_ledger_entries_to_positions(
+                    positions_df=active_positions_df,
+                    cash_entries_df=cash_today,
+                )
+
+        if active_positions_df is None:
+            continue
+
+        price_map = {}
+        if dt in price_matrix.index:
+            row = price_matrix.loc[dt]
+            price_map = {
+                str(ticker).strip().upper(): float(row[ticker])
+                for ticker in price_matrix.columns
+                if pd.notna(row[ticker])
+            }
+
+        team_aum = _apply_position_values(active_positions_df, price_map)
+        rows.append({"date": dt, "team_aum": float(team_aum), "net_external_flow": net_external_flow})
+
+    history_df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+    if history_df.empty:
+        return pd.DataFrame(columns=["date", "team_aum", "net_external_flow", "benchmark_aum"])
+
+    history_df["benchmark_aum"] = pd.NA
+    if benchmark_ticker and benchmark_ticker in price_matrix.columns:
+        bench_prices = pd.to_numeric(price_matrix[benchmark_ticker].reindex(history_df["date"]).values, errors="coerce")
+        valid = pd.Series(bench_prices).dropna()
+        if not valid.empty:
+            scaled = pd.Series(index=history_df.index, dtype="float64")
+            scaled.iloc[0] = float(history_df["team_aum"].iloc[0])
+            if len(history_df) > 1:
+                bench_returns = pd.Series(bench_prices).pct_change()
+                scaled_tail = build_flow_adjusted_benchmark_series(
+                    benchmark_return_series=bench_returns.iloc[1:],
+                    external_flow_series=history_df["net_external_flow"].iloc[1:],
+                    initial_value=float(history_df["team_aum"].iloc[0]),
+                )
+                scaled.iloc[1:] = scaled_tail.values
+            history_df["benchmark_aum"] = scaled.values
+
+    return history_df
+
+
+@st.cache_data(ttl=settings.price_refresh_interval_seconds)
+def get_period_pod_relative_returns(snapshot_df: pd.DataFrame, lookback_days: int) -> pd.DataFrame:
+    if snapshot_df.empty:
+        return pd.DataFrame(columns=["Pod", "Active Return", "Pure Alpha"])
+
+    analytics = get_factor_analytics(snapshot_df)
+    factor_returns_df = analytics.get("factor_returns", pd.DataFrame())
+    if factor_returns_df.empty:
+        return pd.DataFrame(columns=["Pod", "Active Return", "Pure Alpha"])
+
+    factor_inputs = factor_returns_df[["date", "SMB", "MOM", "VAL"]].copy()
+    factor_inputs["date"] = pd.to_datetime(factor_inputs["date"], errors="coerce")
+    for col in ["SMB", "MOM", "VAL"]:
+        factor_inputs[col] = pd.to_numeric(factor_inputs[col], errors="coerce")
+    factor_inputs = factor_inputs.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    if factor_inputs.empty:
+        return pd.DataFrame(columns=["Pod", "Active Return", "Pure Alpha"])
+
+    with session_scope() as session:
+        snapshots_df = load_all_portfolio_snapshots(session)
+
+    teams = [
+        team
+        for team in settings.display_team_order
+        if team != "Cash" and team in snapshot_df[COL_TEAM].dropna().astype(str).str.strip().unique().tolist()
+    ]
+    rows: list[dict[str, float | str]] = []
+
+    for team in teams:
+        benchmark_ticker = TEAM_BENCHMARK_TICKERS.get(team, "SPY")
+        history_df = _build_team_history(team, snapshots_df, benchmark_ticker)
+        if history_df.empty:
+            continue
+
+        team_history = _prepare_team_performance_history(history_df)
+        benchmark_history = prepare_flow_adjusted_history(
+            history_df=history_df,
+            value_column="benchmark_aum",
+            flow_column="net_external_flow",
+        )
+        if (
+            team_history.empty
+            or benchmark_history.empty
+            or "performance_return" not in team_history.columns
+            or "performance_return" not in benchmark_history.columns
+        ):
+            continue
+
+        regression_df = (
+            team_history[["date", "performance_return"]]
+            .rename(columns={"performance_return": "team_return"})
+            .merge(
+                benchmark_history[["date", "performance_return"]].rename(columns={"performance_return": "benchmark_return"}),
+                on="date",
+                how="inner",
+            )
+            .merge(factor_inputs, on="date", how="inner")
+        )
+        regression_df["date"] = pd.to_datetime(regression_df["date"], errors="coerce")
+        for col in ["team_return", "benchmark_return", "SMB", "MOM", "VAL"]:
+            regression_df[col] = pd.to_numeric(regression_df[col], errors="coerce")
+        regression_df = regression_df.dropna(subset=["date", "team_return", "benchmark_return", "SMB", "MOM", "VAL"])
+        regression_df = regression_df.sort_values("date").reset_index(drop=True)
+        if regression_df.empty:
+            continue
+
+        end_date = regression_df["date"].max()
+        regression_window_start = end_date - pd.Timedelta(days=365)
+        trailing_regression_df = regression_df.loc[regression_df["date"] >= regression_window_start].copy()
+        if len(trailing_regression_df) < 20:
+            continue
+
+        x = trailing_regression_df[["benchmark_return", "SMB", "MOM", "VAL"]].to_numpy(dtype=float)
+        y = trailing_regression_df["team_return"].to_numpy(dtype=float)
+        x_with_const = np.column_stack([np.ones(len(trailing_regression_df)), x])
+        try:
+            coefficients, *_ = np.linalg.lstsq(x_with_const, y, rcond=None)
+        except np.linalg.LinAlgError:
+            continue
+
+        regression_df["explained_return"] = (
+            coefficients[1] * regression_df["benchmark_return"]
+            + coefficients[2] * regression_df["SMB"]
+            + coefficients[3] * regression_df["MOM"]
+            + coefficients[4] * regression_df["VAL"]
+        )
+        regression_df["residual"] = regression_df["team_return"] - regression_df["explained_return"]
+        regression_df["active_return"] = regression_df["team_return"] - regression_df["benchmark_return"]
+
+        period_start = end_date - pd.Timedelta(days=lookback_days)
+        period_df = regression_df.loc[regression_df["date"] > period_start, ["active_return", "residual"]].copy()
+        period_df["active_return"] = pd.to_numeric(period_df["active_return"], errors="coerce")
+        period_df["residual"] = pd.to_numeric(period_df["residual"], errors="coerce")
+        period_df = period_df.dropna(how="all")
+        if period_df.empty:
+            continue
+
+        rows.append(
+            {
+                "Pod": team,
+                "Active Return": float(period_df["active_return"].dropna().sum()),
+                "Pure Alpha": float(period_df["residual"].dropna().sum()),
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def _determine_history_start_date(
@@ -820,6 +1143,85 @@ def _compute_daily_return(history_df: pd.DataFrame, current_total_market_value: 
     return float(valid.iloc[-1])
 
 
+def _compute_live_daily_metrics(snapshot_df: pd.DataFrame) -> tuple[float | None, float | None, pd.Timestamp | None]:
+    """
+    Compute mark-to-market daily P&L and return using live prices versus prior close.
+
+    This is intentionally separate from the carried daily history series because the
+    history builder uses daily bars only, which can be stale intraday.
+    """
+    if snapshot_df.empty or COL_MARKET_VALUE not in snapshot_df.columns:
+        return None, None, None
+
+    current_total_market_value = float(
+        pd.to_numeric(snapshot_df[COL_MARKET_VALUE], errors="coerce").fillna(0.0).sum()
+    )
+    if current_total_market_value == 0:
+        return None, None, None
+
+    investable_df = snapshot_df.loc[~_cash_like_mask(snapshot_df)].copy()
+    if investable_df.empty:
+        return 0.0, 0.0, None
+
+    tickers = (
+        investable_df[COL_TICKER]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .loc[lambda s: s.ne("")]
+        .unique()
+        .tolist()
+    )
+    if not tickers:
+        return None, None, None
+
+    lookback_days = 10
+    history_prices_df = fetch_multiple_price_histories(tickers=tickers, lookback_days=lookback_days)
+    if history_prices_df.empty:
+        return None, None, None
+
+    price_history = history_prices_df.copy()
+    price_history["date"] = pd.to_datetime(price_history["date"], errors="coerce")
+    price_history["ticker"] = price_history["ticker"].astype(str).str.strip().str.upper()
+    price_history["adj_close"] = pd.to_numeric(price_history.get("adj_close"), errors="coerce")
+    price_history["close"] = pd.to_numeric(price_history.get("close"), errors="coerce")
+    price_history["px"] = price_history["adj_close"]
+    missing_adj_mask = price_history["px"].isna()
+    price_history.loc[missing_adj_mask, "px"] = price_history.loc[missing_adj_mask, "close"]
+    price_history = price_history.dropna(subset=["date", "ticker", "px"]).sort_values(["ticker", "date"]).copy()
+    if price_history.empty:
+        return None, None, None
+
+    today = pd.Timestamp.today().normalize()
+    prior_close_candidates = price_history.loc[price_history["date"].dt.normalize() < today, "date"]
+    if prior_close_candidates.empty:
+        prior_close_date = price_history["date"].max()
+    else:
+        prior_close_date = prior_close_candidates.max()
+
+    if pd.isna(prior_close_date):
+        return None, None, None
+
+    prior_close_map = (
+        price_history.loc[price_history["date"].dt.normalize() <= pd.Timestamp(prior_close_date).normalize()]
+        .groupby("ticker", as_index=False)
+        .tail(1)
+        .set_index("ticker")["px"]
+        .to_dict()
+    )
+    if not prior_close_map:
+        return None, None, None
+
+    prior_close_total_market_value = _apply_position_values(snapshot_df, prior_close_map)
+    if prior_close_total_market_value == 0:
+        return None, None, pd.Timestamp(prior_close_date)
+
+    daily_pnl = current_total_market_value - prior_close_total_market_value
+    daily_return = daily_pnl / prior_close_total_market_value
+    return float(daily_return), float(daily_pnl), pd.Timestamp(prior_close_date)
+
+
 def _compute_trailing_pnl(history_df: pd.DataFrame, days: int) -> float | None:
     """
     Compute trailing performance P&L net of external flows.
@@ -874,7 +1276,7 @@ def _latest_history_date(history_df: pd.DataFrame) -> pd.Timestamp | None:
 
 
 def render_empty_state() -> None:
-    st.title("Portfolio View")
+    render_page_title("Portfolio View")
     st.info(
         "No reconstructed position state is available yet. Upload snapshots and/or trades, "
         "then rebuild position state."
@@ -965,11 +1367,14 @@ def render_performance_dashboard(snapshot_df: pd.DataFrame, history_df: pd.DataF
     ret_1y = _compute_trailing_return(history_df, 365)
     ret_1m = _compute_trailing_return(history_df, 30)
     ret_1w = _compute_trailing_return(history_df, 7)
-    ret_daily = _compute_daily_return(history_df, current_total_market_value)
     pnl_1y = _compute_trailing_pnl(history_df, 365)
     pnl_1m = _compute_trailing_pnl(history_df, 30)
     pnl_1w = _compute_trailing_pnl(history_df, 7)
-    pnl_daily = _compute_daily_pnl(history_df, current_total_market_value)
+    ret_daily, pnl_daily, prior_close_date = _compute_live_daily_metrics(snapshot_df)
+    if ret_daily is None:
+        ret_daily = _compute_daily_return(history_df, current_total_market_value)
+    if pnl_daily is None:
+        pnl_daily = _compute_daily_pnl(history_df, current_total_market_value)
     latest_business_date = _latest_history_date(history_df)
 
     def _value_class(value) -> str:
@@ -1002,7 +1407,12 @@ def render_performance_dashboard(snapshot_df: pd.DataFrame, history_df: pd.DataF
 
         st.markdown("<div style='height: 0.75rem;'></div>", unsafe_allow_html=True)
 
-    if latest_business_date is not None:
+    if prior_close_date is not None:
+        st.caption(
+            f"Daily return and daily P&L are mark-to-market versus the prior close on "
+            f"{prior_close_date.strftime('%A, %B %d, %Y')}."
+        )
+    elif latest_business_date is not None:
         st.caption(
             f"Daily return and daily P&L are as of {latest_business_date.strftime('%A, %B %d, %Y')}, "
             "the latest business day in the portfolio history."
@@ -1225,10 +1635,88 @@ def _render_pnl_mover_table(
             )
 
 
+def _render_period_heatmap(
+    snapshot_df: pd.DataFrame,
+    period_label: str,
+    lookback_days: int,
+) -> None:
+    relative_df = get_period_pod_relative_returns(
+        snapshot_df=snapshot_df,
+        lookback_days=lookback_days,
+    )
+    if relative_df.empty:
+        st.info(f"{period_label} pod return heatmap is unavailable.")
+        return
+
+    pod_order = [team for team in settings.display_team_order if team in relative_df["Pod"].tolist()]
+    plot_df = (
+        relative_df.set_index("Pod")[["Active Return", "Pure Alpha"]]
+        .T.reindex(columns=pod_order)
+        .dropna(how="all")
+    )
+    if plot_df.empty:
+        st.info(f"{period_label} pod return heatmap is unavailable.")
+        return
+
+    numeric_values = pd.to_numeric(pd.Series(plot_df.to_numpy().ravel()), errors="coerce").dropna()
+    max_abs = float(numeric_values.abs().max()) if not numeric_values.empty else 0.0
+    if not np.isfinite(max_abs) or max_abs == 0:
+        max_abs = 0.01
+    text_df = plot_df.copy().map(_format_percent)
+
+    fig = px.imshow(
+        plot_df,
+        color_continuous_scale="RdBu",
+        aspect="auto",
+        zmin=-max_abs,
+        zmax=max_abs,
+    )
+    fig.update_traces(
+        text=text_df.to_numpy(),
+        texttemplate="%{text}",
+        textfont=dict(size=16),
+    )
+    fig.update_layout(
+        height=320,
+        margin=dict(t=20, b=20, l=92),
+    )
+    fig.update_coloraxes(showscale=False, cmid=0.0)
+    fig.update_xaxes(title_text="")
+    fig.update_yaxes(title_text="", showticklabels=False)
+    fig.update_layout(
+        annotations=[
+            dict(
+                x=-0.018,
+                y=0.75,
+                xref="paper",
+                yref="paper",
+                text="Active Return",
+                textangle=-90,
+                showarrow=False,
+                font=dict(size=14, color="#E2E8F0"),
+                xanchor="center",
+                yanchor="middle",
+            ),
+            dict(
+                x=-0.018,
+                y=0.25,
+                xref="paper",
+                yref="paper",
+                text="Pure Alpha",
+                textangle=-90,
+                showarrow=False,
+                font=dict(size=14, color="#E2E8F0"),
+                xanchor="center",
+                yanchor="middle",
+            ),
+        ]
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def render_pnl_movers(snapshot_df: pd.DataFrame) -> None:
     st.markdown("<div style='height: 0.5rem;'></div>", unsafe_allow_html=True)
-
-    daily_tab, weekly_tab, ytd_tab = st.tabs(["Daily", "Weekly", "YTD"])
+    daily_tab, weekly_tab, ytd_tab, one_year_tab = st.tabs(["Daily", "Weekly", "YTD", "1 Year"])
 
     with daily_tab:
         _render_pnl_mover_table(
@@ -1236,6 +1724,7 @@ def render_pnl_movers(snapshot_df: pd.DataFrame) -> None:
             period_label="Daily",
             lookback_days=1,
         )
+        _render_period_heatmap(snapshot_df, "Daily", 1)
 
     with weekly_tab:
         _render_pnl_mover_table(
@@ -1243,6 +1732,7 @@ def render_pnl_movers(snapshot_df: pd.DataFrame) -> None:
             period_label="Weekly",
             lookback_days=7,
         )
+        _render_period_heatmap(snapshot_df, "Weekly", 7)
 
     with ytd_tab:
         _render_pnl_mover_table(
@@ -1250,6 +1740,15 @@ def render_pnl_movers(snapshot_df: pd.DataFrame) -> None:
             period_label="YTD",
             lookback_days=_get_ytd_lookback_days(),
         )
+        _render_period_heatmap(snapshot_df, "YTD", _get_ytd_lookback_days())
+
+    with one_year_tab:
+        _render_pnl_mover_table(
+            snapshot_df=snapshot_df,
+            period_label="1 Year",
+            lookback_days=365,
+        )
+        _render_period_heatmap(snapshot_df, "1 Year", 365)
 
 def _render_movers_bar_chart(df: pd.DataFrame, pnl_col: str, title: str) -> None:
     if df.empty:
@@ -1517,9 +2016,13 @@ def render_full_holdings_snapshot(snapshot_df: pd.DataFrame) -> None:
 
 
 def main() -> None:
+
     st.set_page_config(page_title="Portfolio View", layout="wide")
+    apply_app_theme()
+    render_top_nav()
     apply_page_theme()
-    st.title("Portfolio View")
+    render_page_title("Portfolio View")
+
 
     snapshot_df = get_master_fund_snapshot()
 

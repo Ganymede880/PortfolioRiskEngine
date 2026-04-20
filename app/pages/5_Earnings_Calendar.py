@@ -38,7 +38,7 @@ from src.config.settings import settings
 from src.data.price_fetcher import fetch_latest_prices
 from src.db.crud import load_position_state
 from src.db.session import session_scope
-from src.utils.ui import apply_app_theme
+from src.utils.ui import apply_app_theme, render_page_title, render_top_nav
 
 
 COL_TICKER = "ticker"
@@ -97,7 +97,6 @@ def _render_summary_card(label: str, value: str) -> None:
 
 
 def _apply_page_theme() -> None:
-    apply_app_theme()
     st.markdown(
         """
         <style>
@@ -938,59 +937,23 @@ def render_month_tab(events_df: pd.DataFrame, window: dict[str, pd.Timestamp | s
 
 def main() -> None:
     st.set_page_config(page_title="Earnings Calendar", layout="wide")
+    apply_app_theme()
+    render_top_nav()
     _apply_page_theme()
-    st.title("Earnings Calendar")
+    render_page_title("Earnings Calendar")
 
     holdings_snapshot_df = get_holdings_universe()
 
-    universe_options = ["Current Holdings Only", "Custom Ticker List"]
-    selected_universe = st.sidebar.radio("Universe", universe_options, index=0)
-
-    custom_ticker_input = ""
-    if selected_universe == "Custom Ticker List":
-        custom_ticker_input = st.sidebar.text_input(
-            "Custom Tickers",
-            value="",
-            help="Enter comma-separated tickers, for example: AAPL, MSFT, NVDA",
-        )
-
-    pod_options = []
-    selected_pods: list[str] = []
-    if selected_universe == "Current Holdings Only" and not holdings_snapshot_df.empty:
-        pod_options = sorted(holdings_snapshot_df[COL_TEAM].dropna().astype(str).str.strip().unique().tolist())
-        selected_pods = st.sidebar.multiselect("Pod Filter", options=pod_options, default=pod_options)
-
-    ticker_search = st.sidebar.text_input("Ticker Search", value="")
-
-    if selected_universe == "Current Holdings Only" and holdings_snapshot_df.empty:
+    if holdings_snapshot_df.empty:
         st.info(
             "No current holdings are available yet. Upload snapshots and/or trades, then rebuild position state."
         )
         return
 
-    custom_tickers = tuple(
-        sorted(
-            {
-                ticker.strip().upper()
-                for ticker in custom_ticker_input.split(",")
-                if ticker.strip()
-            }
-        )
-    )
-    if selected_universe == "Custom Ticker List" and not custom_tickers:
-        st.info("Enter one or more comma-separated tickers in the sidebar to load the custom earnings calendar.")
-        return
-
     events_df = get_earnings_calendar_data(
         snapshot_df=holdings_snapshot_df,
-        selected_universe=selected_universe,
-        custom_tickers=custom_tickers,
-    )
-    events_df = _apply_earnings_filters(
-        events_df=events_df,
-        selected_universe=selected_universe,
-        selected_pods=selected_pods,
-        ticker_search=ticker_search,
+        selected_universe="Current Holdings Only",
+        custom_tickers=tuple(),
     )
 
     windows = _month_windows()

@@ -43,7 +43,8 @@ from src.db.crud import (
 from src.db.session import session_scope
 from src.analytics.ledger import apply_cash_ledger_entries_to_positions, apply_trades_to_positions
 from src.utils.constants import FACTOR_COLORS as SHARED_FACTOR_COLORS
-from src.utils.ui import apply_app_theme, left_align_dataframe
+from src.utils.ui import apply_app_theme, left_align_dataframe, render_page_title, render_top_nav
+
 
 
 COL_DATE = "as_of_date"
@@ -202,10 +203,27 @@ def _compute_one_year_max_drawdown(return_series: pd.Series) -> float | None:
 
 
 def _apply_team_page_theme() -> None:
-    apply_app_theme()
     st.markdown(
         """
         <style>
+        div[data-testid="stTabs"] [data-baseweb="tab-list"] {
+            gap: 0.8rem;
+        }
+
+        div[data-testid="stTabs"] button[role="tab"] {
+            color: rgba(226, 232, 240, 0.74);
+        }
+
+        div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+            color: #DBEAFE;
+        }
+
+        div[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+            background: linear-gradient(135deg, rgba(20, 52, 110, 0.98), rgba(29, 78, 216, 0.94)) !important;
+            height: 0.2rem !important;
+            border-radius: 999px !important;
+        }
+
         .pod-summary-card {
             background: linear-gradient(135deg, rgba(14, 116, 144, 0.14), rgba(59, 130, 246, 0.18));
             border: 1px solid rgba(14, 116, 144, 0.22);
@@ -474,7 +492,7 @@ def get_factor_analytics(snapshot_df: pd.DataFrame):
     return builder(snapshot_df)
 
 
-def _get_team_selector(snapshot_df: pd.DataFrame) -> str:
+def _get_team_options(snapshot_df: pd.DataFrame) -> list[str]:
     teams = (
         snapshot_df[COL_TEAM]
         .dropna()
@@ -486,7 +504,7 @@ def _get_team_selector(snapshot_df: pd.DataFrame) -> str:
     )
     ordered = [team for team in settings.display_team_order if team in teams]
     fallback = sorted([team for team in teams if team not in ordered])
-    return st.sidebar.selectbox("Select Pod", options=ordered + fallback)
+    return ordered + fallback
 
 
 def _build_holding_metadata(team: str, snapshots_df: pd.DataFrame) -> pd.DataFrame:
@@ -771,7 +789,7 @@ def _build_team_holdings_view(team_df: pd.DataFrame, snapshots_df: pd.DataFrame)
 
 
 def render_empty_state() -> None:
-    st.title("Sector View")
+    render_page_title("Sector View")
     st.info(
         "No reconstructed position state is available yet. Upload snapshots and/or trades, "
         "then rebuild position state."
@@ -1094,31 +1112,36 @@ def render_team_factor_loadings(team: str, history_df: pd.DataFrame, analytics: 
 
 def main() -> None:
     st.set_page_config(page_title="Sector View", layout="wide")
+    apply_app_theme()
+    render_top_nav()
     _apply_team_page_theme()
-    st.title("Sector View")
+    render_page_title("Sector View")
 
     snapshot_df, snapshots_df = get_team_view_data()
     if snapshot_df.empty:
         render_empty_state()
         return
 
-    selected_team = _get_team_selector(snapshot_df)
-    team_df = snapshot_df.loc[snapshot_df[COL_TEAM] == selected_team].copy()
-    benchmark_ticker = TEAM_BENCHMARK_TICKERS.get(selected_team, "SPY")
-    history_df = _build_team_history(selected_team, snapshots_df, benchmark_ticker)
-    formatted_holdings_df, chart_df = _build_team_holdings_view(team_df, snapshots_df)
     factor_analytics = get_factor_analytics(snapshot_df)
+    team_options = _get_team_options(snapshot_df)
+    team_tabs = st.tabs(team_options)
 
-    st.caption(f"Viewing pod: {selected_team}")
-    render_team_dashboard(team_df, history_df, snapshots_df, selected_team)
-    st.divider()
-    render_holdings_table(formatted_holdings_df)
-    st.divider()
-    render_team_charts(team_df, chart_df, selected_team)
-    st.divider()
-    render_team_history(history_df, selected_team)
-    st.divider()
-    render_team_factor_loadings(selected_team, history_df, factor_analytics)
+    for team_name, team_tab in zip(team_options, team_tabs):
+        with team_tab:
+            team_df = snapshot_df.loc[snapshot_df[COL_TEAM] == team_name].copy()
+            benchmark_ticker = TEAM_BENCHMARK_TICKERS.get(team_name, "SPY")
+            history_df = _build_team_history(team_name, snapshots_df, benchmark_ticker)
+            formatted_holdings_df, chart_df = _build_team_holdings_view(team_df, snapshots_df)
+
+            render_team_dashboard(team_df, history_df, snapshots_df, team_name)
+            st.divider()
+            render_holdings_table(formatted_holdings_df)
+            st.divider()
+            render_team_charts(team_df, chart_df, team_name)
+            st.divider()
+            render_team_history(history_df, team_name)
+            st.divider()
+            render_team_factor_loadings(team_name, history_df, factor_analytics)
 
 
 if __name__ == "__main__":

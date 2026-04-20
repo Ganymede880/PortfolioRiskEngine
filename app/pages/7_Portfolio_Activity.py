@@ -30,11 +30,45 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.db import crud
 from src.db.session import session_scope
 from src.config.settings import settings
-from src.utils.ui import apply_app_theme, left_align_dataframe
+from src.utils.ui import apply_app_theme, left_align_dataframe, render_page_title, render_top_nav
 
 
 def _apply_portfolio_activity_filter_theme() -> None:
-    return None
+    st.markdown(
+        """
+        <style>
+        .activity-metric-card {
+            background: linear-gradient(135deg, rgba(14, 116, 144, 0.14), rgba(59, 130, 246, 0.18));
+            border: 1px solid rgba(14, 116, 144, 0.22);
+            border-radius: 16px;
+            color: inherit;
+            padding: 1rem 1.1rem;
+            box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+            min-height: 112px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        .activity-metric-card-label {
+            color: inherit;
+            opacity: 0.8;
+            font-size: 0.95rem;
+            font-weight: 500;
+            line-height: 1.25;
+            margin-bottom: 0.35rem;
+        }
+
+        .activity-metric-card-value {
+            color: inherit;
+            font-size: 1.65rem;
+            font-weight: 600;
+            line-height: 1.2;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _format_currency(value):
@@ -143,19 +177,32 @@ def _render_summary_metrics(activity_df: pd.DataFrame) -> None:
             pd.to_numeric(cash_metric_df["cash_impact"], errors="coerce").sum(skipna=True)
         )
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Events", f"{total_events:,}")
-    col2.metric("Trades", f"{trade_events:,}")
-    col3.metric("Reconciliations", f"{reconciliation_events:,}")
-    col4.metric("Net Cash Impact", _format_currency(total_cash_impact))
+    with st.container(border=True):
+        row = st.columns(4)
+        metrics = [
+            ("Events", f"{total_events:,}"),
+            ("Trades", f"{trade_events:,}"),
+            ("Reconciliations", f"{reconciliation_events:,}"),
+            ("Net Cash Impact", _format_currency(total_cash_impact)),
+        ]
+        for column, (label, value) in zip(row, metrics):
+            with column:
+                st.markdown(
+                    f"""
+                    <div class="activity-metric-card">
+                        <div class="activity-metric-card-label">{label}</div>
+                        <div class="activity-metric-card-value">{value}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        st.markdown("<div style='height: 0.75rem;'></div>", unsafe_allow_html=True)
 
 
 def _render_filters(activity_df: pd.DataFrame) -> tuple[str, list[str], str]:
     """
-    Render sidebar filters and return selected values.
+    Render in-page filters and return selected values.
     """
-    st.sidebar.header("Filters")
-
     teams = []
     if "team" in activity_df.columns:
         teams = (
@@ -172,8 +219,6 @@ def _render_filters(activity_df: pd.DataFrame) -> tuple[str, list[str], str]:
     fallback_teams = [team for team in teams if team not in ordered_teams]
     team_options = ["All"] + ordered_teams + sorted(fallback_teams)
 
-    selected_team = st.sidebar.selectbox("Pod", options=team_options)
-
     activity_type_options = []
     if "activity_type" in activity_df.columns:
         activity_type_options = sorted(
@@ -184,13 +229,17 @@ def _render_filters(activity_df: pd.DataFrame) -> tuple[str, list[str], str]:
             .tolist()
         )
 
-    selected_activity_types = st.sidebar.multiselect(
-        "Activity Types",
-        options=activity_type_options,
-        default=[],
-    )
-
-    ticker_search = st.sidebar.text_input("Search Ticker", value="").strip()
+    filter_col_1, filter_col_2, filter_col_3 = st.columns([1.0, 1.3, 1.0])
+    with filter_col_1:
+        selected_team = st.selectbox("Pod", options=team_options)
+    with filter_col_2:
+        selected_activity_types = st.multiselect(
+            "Activity Types",
+            options=activity_type_options,
+            default=[],
+        )
+    with filter_col_3:
+        ticker_search = st.text_input("Search Ticker", value="").strip()
 
     return selected_team, selected_activity_types, ticker_search
 
@@ -198,9 +247,10 @@ def _render_filters(activity_df: pd.DataFrame) -> tuple[str, list[str], str]:
 def main() -> None:
     st.set_page_config(page_title="Portfolio Activity", layout="wide")
     apply_app_theme()
+    render_top_nav()
     _apply_portfolio_activity_filter_theme()
     init_db()
-    st.title("Portfolio Activity")
+    render_page_title("Portfolio Activity")
 
     with session_scope() as session:
         activity_df = crud.load_portfolio_activity(session=session)
@@ -209,6 +259,7 @@ def main() -> None:
         st.info("No portfolio activity is available yet. Upload snapshots or trade receipts to populate this page.")
         return
 
+    _render_summary_metrics(activity_df)
     selected_team, selected_activity_types, ticker_search = _render_filters(activity_df)
 
     filtered_df = _filter_activity(
@@ -217,8 +268,6 @@ def main() -> None:
         selected_activity_types=selected_activity_types,
         ticker_search=ticker_search,
     )
-
-    _render_summary_metrics(filtered_df)
     st.divider()
 
     st.subheader("Activity Feed")

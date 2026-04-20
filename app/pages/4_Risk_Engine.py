@@ -29,7 +29,7 @@ from src.data.price_fetcher import fetch_latest_prices, fetch_multiple_price_his
 from src.db.crud import load_all_portfolio_snapshots, load_cash_ledger, load_position_state, load_trade_receipts
 from src.db.session import session_scope
 from src.utils.constants import FACTOR_COLORS
-from src.utils.ui import apply_app_theme, left_align_dataframe, style_plotly_figure
+from src.utils.ui import apply_app_theme, left_align_dataframe, style_plotly_figure, render_top_nav
 
 
 COL_TICKER = "ticker"
@@ -90,7 +90,7 @@ SCENARIO_LIBRARY = {
         "shock_mom": -0.03,
         "shock_val": 0.02,
     },
-    "Quality Rotation / Beta Down": {
+    "Quality Rotation": {
         "description": "Market declines and high-beta / crowded factor books are de-risked.",
         "shock_mkt": -0.04,
         "shock_smb": -0.02,
@@ -281,6 +281,23 @@ def render_header() -> None:
     st.markdown(
         """
         <style>
+        div[data-testid="stSelectbox"] {
+            max-width: 230px;
+        }
+
+        div[data-testid="stSelectbox"] > div[data-baseweb="select"] > div {
+            background: linear-gradient(135deg, rgba(20, 52, 110, 0.94), rgba(29, 78, 216, 0.9));
+            border: 1px solid rgba(96, 165, 250, 0.34);
+            border-radius: 12px;
+            min-height: 2.6rem;
+            box-shadow: 0 10px 22px rgba(15, 23, 42, 0.16);
+        }
+
+        div[data-testid="stSelectbox"] [role="combobox"] {
+            color: #E2E8F0;
+            font-weight: 600;
+        }
+
         .risk-dashboard-card {
             background: linear-gradient(135deg, rgba(14, 116, 144, 0.14), rgba(59, 130, 246, 0.18));
             border: 1px solid rgba(14, 116, 144, 0.22);
@@ -843,7 +860,6 @@ def render_fund_dashboard(fund_metrics: dict[str, float | None]) -> None:
 
 
 def render_team_correlation_matrix(correlation_matrix_df: pd.DataFrame) -> None:
-    st.subheader("Cross-Pod Correlation Matrix")
     if correlation_matrix_df.empty:
         st.info("Cross-pod correlation data is unavailable.")
         return
@@ -866,14 +882,14 @@ def render_team_correlation_matrix(correlation_matrix_df: pd.DataFrame) -> None:
             yanchor="top",
             len=0.7,
         ),
-        margin=dict(t=90, b=110),
+        margin=dict(t=48, b=110),
+        height=520,
     )
     fig = style_plotly_figure(fig, title_text="POD RETURN CORRELATION HEATMAP")
     st.plotly_chart(fig, use_container_width=True)
 
 
 def render_risk_decomposition(risk_decomposition_df: pd.DataFrame, reason: str | None = None) -> None:
-    st.subheader("Risk Decomposition")
     if risk_decomposition_df.empty:
         _render_na_reason("N/A: risk decomposition is unavailable.", reason)
         return
@@ -924,7 +940,8 @@ def render_risk_decomposition(risk_decomposition_df: pd.DataFrame, reason: str |
     )
     fig.update_layout(
         legend=dict(title=None, orientation="h", yanchor="top", y=-0.22, xanchor="center", x=0.5),
-        margin=dict(t=90, b=110),
+        margin=dict(t=48, b=110),
+        height=520,
     )
     fig = style_plotly_figure(fig, title_text="PORTFOLIO RISK CONTRIBUTION")
     st.plotly_chart(fig, use_container_width=True)
@@ -1113,12 +1130,15 @@ def render_scenario_analysis(
         return
 
     scenario_names = list(SCENARIO_LIBRARY.keys())
-    selected_scenario = st.selectbox(
-        "Select Scenario",
-        options=scenario_names,
-        index=0,
-        key="risk_engine_scenario_library",
-    )
+    selector_col, _ = st.columns([0.3, 0.7])
+    with selector_col:
+        selected_scenario = st.selectbox(
+            "Select Scenario",
+            options=scenario_names,
+            index=0,
+            key="risk_engine_scenario_library",
+            label_visibility="collapsed",
+        )
 
     scenario = SCENARIO_LIBRARY[selected_scenario]
     st.caption(scenario.get("description", ""))
@@ -1353,6 +1373,7 @@ def render_notes(notes: list[str]) -> None:
 def main() -> None:
     st.set_page_config(page_title="Risk Engine", layout="wide")
     apply_app_theme()
+    render_top_nav()
     render_header()
 
     snapshot_df = get_base_snapshot()
@@ -1371,6 +1392,7 @@ def main() -> None:
     st.divider()
     render_team_metrics(team_metrics_data.get("team_metrics", pd.DataFrame()))
     st.divider()
+    st.subheader("Risk Architecture")
     correlation_col, risk_col = st.columns(2)
     with correlation_col:
         render_team_correlation_matrix(team_metrics_data.get("correlation_matrix", pd.DataFrame()))

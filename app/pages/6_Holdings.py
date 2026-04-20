@@ -34,7 +34,7 @@ from src.data.price_fetcher import fetch_latest_prices, fetch_multiple_price_his
 from src.db.crud import load_position_state
 from src.db.session import session_scope
 from src.utils.constants import TEAM_COLORS
-from src.utils.ui import apply_app_theme, left_align_dataframe
+from src.utils.ui import apply_app_theme, left_align_dataframe, render_top_nav
 
 
 COL_TEAM = "team"
@@ -93,49 +93,24 @@ def apply_holdings_page_theme() -> None:
     st.markdown(
         """
         <style>
-        .holdings-metric-card {
-            background: linear-gradient(135deg, rgba(14, 116, 144, 0.14), rgba(59, 130, 246, 0.18));
-            border: 1px solid rgba(14, 116, 144, 0.22);
-            border-radius: 16px;
-            color: inherit;
-            padding: 1rem 1.1rem;
-            box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
-            min-height: 112px;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
+        div[data-testid="stSlider"] {
+            max-width: 320px;
+            margin: 0 auto;
         }
 
-        .holdings-metric-card-label {
-            color: inherit;
-            opacity: 0.8;
-            font-size: 0.95rem;
-            font-weight: 500;
-            line-height: 1.25;
-            margin-bottom: 0.35rem;
+        div[data-testid="stSlider"] [data-baseweb="slider"] > div > div:nth-child(1) {
+            background: rgba(51, 65, 85, 0.5) !important;
         }
 
-        .holdings-metric-card-value {
-            color: inherit;
-            font-size: 1.65rem;
-            font-weight: 600;
-            line-height: 1.2;
+        div[data-testid="stSlider"] [data-baseweb="slider"] > div > div:nth-child(2) {
+            background: linear-gradient(135deg, rgba(20, 52, 110, 0.96), rgba(29, 78, 216, 0.92)) !important;
+        }
+
+        div[data-testid="stSlider"] [role="slider"] {
+            background: #1D4ED8 !important;
+            border: 2px solid rgba(191, 219, 254, 0.88) !important;
         }
         </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def _render_holdings_metric_card(label: str, value: str) -> None:
-    safe_label = html.escape(label)
-    safe_value = html.escape(value)
-    st.markdown(
-        f"""
-        <div class="holdings-metric-card">
-            <div class="holdings-metric-card-label">{safe_label}</div>
-            <div class="holdings-metric-card-value">{safe_value}</div>
-        </div>
         """,
         unsafe_allow_html=True,
     )
@@ -465,8 +440,6 @@ def _apply_holdings_filter_theme() -> None:
 
 
 def render_filters(snapshot_df: pd.DataFrame) -> pd.DataFrame:
-    st.sidebar.header("Filters")
-
     teams = (
         snapshot_df[COL_TEAM]
         .dropna()
@@ -481,9 +454,13 @@ def render_filters(snapshot_df: pd.DataFrame) -> pd.DataFrame:
     team_options = ["All"] + ordered_teams + sorted(fallback_teams)
 
     side_options = ["All", "LONG", "SHORT", "CASH"]
-    selected_team = st.sidebar.selectbox("Pod", options=team_options)
-    selected_side = st.sidebar.selectbox("Position Side", options=side_options)
-    ticker_search = st.sidebar.text_input("Search Ticker", value="").strip().upper()
+    filter_col_1, filter_col_2, filter_col_3 = st.columns([1.0, 1.0, 1.2])
+    with filter_col_1:
+        selected_team = st.selectbox("Pod", options=team_options)
+    with filter_col_2:
+        selected_side = st.selectbox("Position Side", options=side_options)
+    with filter_col_3:
+        ticker_search = st.text_input("Search Ticker", value="").strip().upper()
 
     filtered = snapshot_df.copy()
     if selected_team != "All":
@@ -498,14 +475,22 @@ def render_filters(snapshot_df: pd.DataFrame) -> pd.DataFrame:
     return filtered.reset_index(drop=True)
 
 
-def render_constellation_controls() -> tuple[float, bool]:
-    st.sidebar.header("Constellation")
-    threshold = st.sidebar.slider("Correlation Threshold", min_value=0.20, max_value=0.90, value=0.50, step=0.05)
-    compact_cluster_packing = st.sidebar.checkbox("Compact Cluster Packing", value=True)
-    return float(threshold), bool(compact_cluster_packing)
+def render_constellation_threshold_control() -> float:
+    left_col, center_col, right_col = st.columns([0.32, 0.36, 0.32])
+    with center_col:
+        return float(
+            st.slider(
+                "Correlation Threshold",
+                min_value=0.20,
+                max_value=0.90,
+                value=0.50,
+                step=0.05,
+                key="holdings_corr_threshold",
+            )
+        )
 
 
-def render_holdings_constellation(graph_payload: dict[str, object] | None, compact_cluster_packing: bool = True) -> None:
+def render_holdings_constellation(graph_payload: dict[str, object] | None) -> None:
     st.subheader("Holdings Constellation")
 
     if nx is None:
@@ -534,7 +519,7 @@ def render_holdings_constellation(graph_payload: dict[str, object] | None, compa
     for row in edges_df.itertuples(index=False):
         graph.add_edge(row.source, row.target, correlation=float(row.correlation), strength=float(row.strength))
 
-    positions = _compute_graph_positions(graph, compact_cluster_packing=compact_cluster_packing)
+    positions = _compute_graph_positions(graph, compact_cluster_packing=True)
     total_abs_mv = float(pd.to_numeric(nodes_df["abs_market_value"], errors="coerce").sum()) or 1.0
 
     fig = go.Figure()
@@ -641,28 +626,10 @@ def render_holdings_constellation(graph_payload: dict[str, object] | None, compa
     )
 
 
-def render_summary_metrics(filtered_df: pd.DataFrame) -> None:
-    total_market_value = float(pd.to_numeric(filtered_df[COL_MARKET_VALUE], errors="coerce").sum(skipna=True)) if not filtered_df.empty else 0.0
-    gross_exposure = float(pd.to_numeric(filtered_df[COL_MARKET_VALUE], errors="coerce").abs().sum(skipna=True)) if not filtered_df.empty else 0.0
-    unique_tickers = int(filtered_df[COL_TICKER].nunique(dropna=True)) if not filtered_df.empty else 0
-    unique_teams = int(filtered_df[COL_TEAM].nunique(dropna=True)) if not filtered_df.empty else 0
-
-    with st.container(border=True):
-        row = st.columns(4)
-        with row[0]:
-            _render_holdings_metric_card("Filtered Market Value", _format_currency(total_market_value))
-        with row[1]:
-            _render_holdings_metric_card("Gross Exposure", _format_currency(gross_exposure))
-        with row[2]:
-            _render_holdings_metric_card("Tickers", f"{unique_tickers:,}")
-        with row[3]:
-            _render_holdings_metric_card("Pods", f"{unique_teams:,}")
-        st.markdown("<div style='height: 0.75rem;'></div>", unsafe_allow_html=True)
-
-
-def render_holdings_table(filtered_df: pd.DataFrame) -> None:
+def render_holdings_table(snapshot_df: pd.DataFrame) -> None:
     st.subheader("Holdings Detail")
 
+    filtered_df = render_filters(snapshot_df)
     if filtered_df.empty:
         st.warning("No holdings matched the current filters.")
         return
@@ -689,6 +656,7 @@ def render_holdings_table(filtered_df: pd.DataFrame) -> None:
 def main() -> None:
     st.set_page_config(page_title="Holdings", layout="wide")
     apply_app_theme()
+    render_top_nav()
     apply_holdings_page_theme()
     _apply_holdings_filter_theme()
     st.title("Holdings")
@@ -698,20 +666,17 @@ def main() -> None:
         render_empty_state()
         return
 
-    threshold, compact_cluster_packing = render_constellation_controls()
-    filtered_df = render_filters(snapshot_df)
-    render_summary_metrics(filtered_df)
-    st.divider()
-
-    constellation_history_df = get_constellation_price_history(filtered_df, lookback_days=120)
+    threshold = float(st.session_state.get("holdings_corr_threshold", 0.50))
+    constellation_history_df = get_constellation_price_history(snapshot_df, lookback_days=120)
     graph_payload = build_correlation_graph(
-        filtered_df,
+        snapshot_df,
         constellation_history_df,
         threshold=threshold,
     )
-    render_holdings_constellation(graph_payload, compact_cluster_packing=compact_cluster_packing)
+    render_holdings_constellation(graph_payload)
+    render_constellation_threshold_control()
     st.divider()
-    render_holdings_table(filtered_df)
+    render_holdings_table(snapshot_df)
 
 
 if __name__ == "__main__":

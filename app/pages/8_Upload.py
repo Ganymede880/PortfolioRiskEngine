@@ -60,7 +60,7 @@ from src.analytics.ledger import (
     reconcile_expected_positions_to_authoritative_snapshot,
 )
 from src.db import crud
-from src.utils.ui import apply_app_theme, left_align_dataframe
+from src.utils.ui import apply_app_theme, left_align_dataframe, render_top_nav
 
 
 def _apply_upload_control_theme() -> None:
@@ -550,6 +550,7 @@ def _save_snapshot_with_reconciliation(
 def main() -> None:
     st.set_page_config(page_title="Upload", layout="wide")
     apply_app_theme()
+    render_top_nav()
     _apply_upload_control_theme()
     st.title("Upload")
 

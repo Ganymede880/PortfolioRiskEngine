@@ -29,8 +29,7 @@ from src.data.price_fetcher import fetch_latest_prices
 from src.db.crud import load_position_state
 from src.db.session import session_scope
 from src.utils.constants import FACTOR_COLORS
-from src.utils.ui import apply_app_theme, left_align_dataframe, style_plotly_figure
-
+from src.utils.ui import apply_app_theme, left_align_dataframe, style_plotly_figure, render_top_nav
 
 COL_TICKER = "ticker"
 COL_MARKET_VALUE = "market_value"
@@ -882,7 +881,9 @@ def render_notes(notes: list[str]) -> None:
 def main() -> None:
     st.set_page_config(page_title="Factor Model", layout="wide")
     apply_app_theme()
+    render_top_nav()
     render_header()
+
 
     snapshot_df = get_base_snapshot()
     if snapshot_df.empty:
