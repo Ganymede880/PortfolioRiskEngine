@@ -373,6 +373,23 @@ def pack_component_layouts(component_layouts: list[dict[str, object]], gap: floa
     return packed_positions
 
 
+def _layout_component(component: "nx.Graph") -> dict[str, tuple[float, float]]:
+    if component.number_of_nodes() == 1:
+        return {next(iter(component.nodes())): (0.0, 0.0)}
+    if component.number_of_nodes() == 2:
+        return nx.spring_layout(component, seed=42, weight="strength", k=0.7)
+
+    try:
+        return nx.kamada_kawai_layout(component, weight="strength")
+    except (ImportError, ModuleNotFoundError):
+        return nx.spring_layout(
+            component,
+            seed=42,
+            weight="strength",
+            k=0.9 / max(component.number_of_nodes(), 1),
+        )
+
+
 def _compute_graph_positions(graph: "nx.Graph", compact_cluster_packing: bool = True) -> dict[str, tuple[float, float]]:
     if graph.number_of_nodes() == 0:
         return {}
@@ -386,12 +403,7 @@ def _compute_graph_positions(graph: "nx.Graph", compact_cluster_packing: bool = 
 
     component_layouts: list[dict[str, object]] = []
     for component in components:
-        if component.number_of_nodes() == 1:
-            positions = {next(iter(component.nodes())): (0.0, 0.0)}
-        elif component.number_of_nodes() == 2:
-            positions = nx.spring_layout(component, seed=42, weight="strength", k=0.7)
-        else:
-            positions = nx.kamada_kawai_layout(component, weight="strength")
+        positions = _layout_component(component)
 
         x_values = [coords[0] for coords in positions.values()]
         y_values = [coords[1] for coords in positions.values()]
