@@ -59,11 +59,29 @@ from src.analytics.ledger import (
     derive_trade_cash_amount,
     reconcile_expected_positions_to_authoritative_snapshot,
 )
+from src.db import crud
 from src.utils.ui import apply_app_theme, left_align_dataframe
 
 
 def _apply_upload_control_theme() -> None:
-    return None
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stButton"] > button[kind="primary"] {
+            background: #B91C1C;
+            border: 1px solid #991B1B;
+            color: #FFFFFF;
+        }
+
+        div[data-testid="stButton"] > button[kind="primary"]:hover {
+            background: #991B1B;
+            border-color: #7F1D1D;
+            color: #FFFFFF;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _save_uploaded_file_temporarily(uploaded_file) -> Path:
@@ -349,6 +367,42 @@ def _render_reconciliation_preview(
         )
 
 
+def _render_clear_uploads_action() -> None:
+    with st.container(border=True):
+        action_col, confirm_col = st.columns([1, 1.4])
+        with action_col:
+            if st.button(
+                "Clear All Uploads",
+                type="primary",
+                use_container_width=True,
+            ):
+                if not st.session_state.get("confirm_clear_all_uploads", False):
+                    st.warning("Check the confirmation box before clearing all uploaded portfolio data.")
+                else:
+                    with session_scope() as session:
+                        counts = crud.clear_all_uploaded_portfolio_data(session)
+                    st.session_state["confirm_clear_all_uploads"] = False
+                    st.session_state["last_clear_all_uploads_counts"] = counts
+                    st.rerun()
+        with confirm_col:
+            st.checkbox(
+                "I understand this will delete all uploaded files.",
+                key="confirm_clear_all_uploads",
+            )
+
+    if "last_clear_all_uploads_counts" in st.session_state:
+        counts = st.session_state.pop("last_clear_all_uploads_counts")
+        st.success(
+            "Cleared uploaded portfolio data: "
+            f"{counts.get('portfolio_snapshots', 0)} snapshot rows, "
+            f"{counts.get('trade_receipts', 0)} trade rows, "
+            f"{counts.get('cash_ledger', 0)} cash ledger rows, "
+            f"{counts.get('reconciliation_events', 0)} reconciliation rows, "
+            f"{counts.get('position_state', 0)} position-state rows, and "
+            f"{counts.get('upload_logs', 0)} upload log rows."
+        )
+
+
 def _save_snapshot_with_reconciliation(
     session,
     snapshot_df: pd.DataFrame,
@@ -518,205 +572,201 @@ def main() -> None:
         accept_multiple_files=False,
     )
 
-    if uploaded_file is None:
-        st.info("Upload a file to begin.")
-        return
-
     temp_path: Path | None = None
 
-    try:
-        temp_path = _save_uploaded_file_temporarily(uploaded_file)
+    if uploaded_file is None:
+        st.info("Upload a file to begin.")
+    else:
+        try:
+            temp_path = _save_uploaded_file_temporarily(uploaded_file)
 
-        preview = preview_uploaded_file(temp_path)
-        detected_type = preview.get("upload_type", "unknown")
+            preview = preview_uploaded_file(temp_path)
+            detected_type = preview.get("upload_type", "unknown")
 
-        st.subheader("Detected File Structure")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("File Type", preview.get("file_type", ""))
-        c2.metric("Sheet", preview.get("selected_sheet") or "CSV")
-        c3.metric("Rows", int(preview.get("row_count", 0)))
-        c4.metric("Detected Type", detected_type or "unknown")
+            st.subheader("Detected File Structure")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("File Type", preview.get("file_type", ""))
+            c2.metric("Sheet", preview.get("selected_sheet") or "CSV")
+            c3.metric("Rows", int(preview.get("row_count", 0)))
+            c4.metric("Detected Type", detected_type or "unknown")
 
-        preview_df = pd.DataFrame(preview.get("preview_rows", []))
-        if not preview_df.empty:
-            st.dataframe(left_align_dataframe(preview_df), use_container_width=True, hide_index=True)
+            preview_df = pd.DataFrame(preview.get("preview_rows", []))
+            if not preview_df.empty:
+                st.dataframe(left_align_dataframe(preview_df), use_container_width=True, hide_index=True)
 
-        st.subheader("Upload Type")
-        trade_like_options = ["snapshot", "trade_receipt", "sector_rebalance", "portfolio_liquidation"]
-        default_index = 0
-        detected_upload_type = detected_type or "unknown"
-        if detected_upload_type in trade_like_options:
-            default_index = trade_like_options.index(detected_upload_type)
-        upload_type = st.radio(
-            "Select upload type",
-            options=trade_like_options,
-            index=default_index,
-            horizontal=True,
-        )
-
-        raw_df, metadata = load_uploaded_file_auto(temp_path)
-
-        st.subheader("Validation")
-        validation = validate_uploaded_dataframe(raw_df, upload_type)
-        _render_validation_block(validation)
-
-        if not validation["is_valid"]:
-            with session_scope() as session:
-                log_upload_event(
-                    session=session,
-                    upload_type=upload_type,
-                    source_file=uploaded_file.name,
-                    selected_sheet=metadata.get("selected_sheet"),
-                    row_count=len(raw_df),
-                    status="validation_failed",
-                    message="; ".join(validation.get("errors", [])),
-                )
-            return
-
-        st.subheader("Normalized Preview")
-
-        if upload_type == "snapshot":
-            norm = normalize_snapshot_and_tag_source(
-                raw_df,
-                source_file=uploaded_file.name,
-                selected_sheet=metadata.get("selected_sheet", ""),
-            )
-            snapshot_df = norm["snapshot"]
-            _render_mapping_notes(norm)
-            st.dataframe(
-                left_align_dataframe(_format_df_preview(snapshot_df)),
-                use_container_width=True,
-                hide_index=True,
+            st.subheader("Upload Type")
+            trade_like_options = ["snapshot", "trade_receipt", "sector_rebalance", "portfolio_liquidation"]
+            default_index = 0
+            detected_upload_type = detected_type or "unknown"
+            if detected_upload_type in trade_like_options:
+                default_index = trade_like_options.index(detected_upload_type)
+            upload_type = st.radio(
+                "Select upload type",
+                options=trade_like_options,
+                index=default_index,
+                horizontal=True,
             )
 
-            st.subheader("Snapshot Date")
-            snapshot_ts = _choose_snapshot_date(snapshot_df)
-            if snapshot_ts is None:
-                st.warning("Please provide a snapshot date.")
-                return
+            raw_df, metadata = load_uploaded_file_auto(temp_path)
 
-            with session_scope() as session:
-                latest_state_date = get_latest_position_state_date(session)
+            st.subheader("Validation")
+            validation = validate_uploaded_dataframe(raw_df, upload_type)
+            _render_validation_block(validation)
 
-                if latest_state_date is not None:
-                    expected_positions_df, between_trades_df = _build_expected_positions_for_snapshot(
-                        session=session,
-                        snapshot_ts=snapshot_ts,
-                    )
-                    effective_ts = _choose_reconciliation_effective_date(snapshot_ts)
-                    assumed_price_map = _build_assumed_price_map_from_snapshot(snapshot_df)
-
-                    _, reconciliation_preview_df, cash_preview_df = reconcile_expected_positions_to_authoritative_snapshot(
-                        expected_positions_df=expected_positions_df,
-                        authoritative_snapshot_df=snapshot_df,
-                        snapshot_date=snapshot_ts,
-                        effective_date=effective_ts,
-                        assumed_price_map=assumed_price_map,
-                        config=ReconciliationConfig(default_assumed_price=None),
-                    )
-
-                    if not between_trades_df.empty:
-                        st.info(
-                            f"Carried forward {len(between_trades_df)} trade receipt row(s) into the expected portfolio before reconciliation."
-                        )
-
-                    _render_reconciliation_preview(
-                        reconciliation_preview_df,
-                        cash_preview_df,
-                    )
-                else:
-                    st.info(
-                        "No prior position state exists. This snapshot will be used as the initial seed."
-                    )
-
-            if st.button("Save Snapshot", type="primary"):
+            if not validation["is_valid"]:
                 with session_scope() as session:
-                    result = _save_snapshot_with_reconciliation(
-                        session=session,
-                        snapshot_df=snapshot_df,
-                        snapshot_ts=snapshot_ts,
-                        uploaded_file_name=uploaded_file.name,
-                        selected_sheet=metadata.get("selected_sheet"),
-                    )
-
-                if result["mode"] == "initial_seed":
-                    st.success(
-                        f"Saved {result['rows_saved']} snapshot rows for {snapshot_ts.date()}, "
-                        f"and seeded {result['position_state_rows']} position-state rows."
-                    )
-                else:
-                    st.success(
-                        f"Saved {result['rows_saved']} snapshot rows for {snapshot_ts.date()}, "
-                        f"applied {result['trade_rows_applied']} trade row(s), "
-                        f"generated {result['reconciliation_rows']} reconciliation row(s), "
-                        f"generated {result['cash_rows']} cash ledger row(s), "
-                        f"and seeded {result['position_state_rows']} position-state rows."
-                    )
-
-        else:
-            norm = normalize_trade_receipt_and_tag_source(
-                raw_df,
-                source_file=uploaded_file.name,
-                selected_sheet=metadata.get("selected_sheet", ""),
-            )
-            trades_df = norm["trades"]
-            _render_mapping_notes(norm)
-            st.dataframe(
-                left_align_dataframe(_format_df_preview(trades_df)),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            external_flow_df = _build_external_flow_entries_for_trade_upload(
-                trades_df=trades_df,
-                upload_type=upload_type,
-            )
-            if not external_flow_df.empty:
-                st.subheader("External Cash Flow Preview")
-                st.dataframe(
-                    left_align_dataframe(_format_df_preview(external_flow_df)),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            if st.button("Save Trades", type="primary"):
-                with session_scope() as session:
-                    rows = save_trade_receipts(
-                        session=session,
-                        trades_df=trades_df,
-                        source_file=uploaded_file.name,
-                        selected_sheet=metadata.get("selected_sheet"),
-                        replace_existing_for_source_file=True,
-                    )
-                    flow_rows = 0
-                    if not external_flow_df.empty:
-                        _delete_external_flow_entries_for_upload(
-                            session=session,
-                            external_flow_df=external_flow_df,
-                        )
-                        flow_rows = save_cash_ledger_entries(
-                            session=session,
-                            cash_df=external_flow_df,
-                        )
                     log_upload_event(
                         session=session,
                         upload_type=upload_type,
                         source_file=uploaded_file.name,
                         selected_sheet=metadata.get("selected_sheet"),
-                        row_count=rows,
-                        status="success",
-                        message=f"Saved {rows} trade rows and {flow_rows} external cash-flow rows.",
+                        row_count=len(raw_df),
+                        status="validation_failed",
+                        message="; ".join(validation.get("errors", [])),
+                    )
+            else:
+                st.subheader("Normalized Preview")
+
+                if upload_type == "snapshot":
+                    norm = normalize_snapshot_and_tag_source(
+                        raw_df,
+                        source_file=uploaded_file.name,
+                        selected_sheet=metadata.get("selected_sheet", ""),
+                    )
+                    snapshot_df = norm["snapshot"]
+                    _render_mapping_notes(norm)
+                    st.dataframe(
+                        left_align_dataframe(_format_df_preview(snapshot_df)),
+                        use_container_width=True,
+                        hide_index=True,
                     )
 
-                if not external_flow_df.empty:
-                    st.success(f"Saved {rows} trade rows and {flow_rows} external cash-flow rows.")
+                    st.subheader("Snapshot Date")
+                    snapshot_ts = _choose_snapshot_date(snapshot_df)
+                    if snapshot_ts is None:
+                        st.warning("Please provide a snapshot date.")
+                    else:
+                        with session_scope() as session:
+                            latest_state_date = get_latest_position_state_date(session)
+
+                            if latest_state_date is not None:
+                                expected_positions_df, between_trades_df = _build_expected_positions_for_snapshot(
+                                    session=session,
+                                    snapshot_ts=snapshot_ts,
+                                )
+                                effective_ts = _choose_reconciliation_effective_date(snapshot_ts)
+                                assumed_price_map = _build_assumed_price_map_from_snapshot(snapshot_df)
+
+                                _, reconciliation_preview_df, cash_preview_df = reconcile_expected_positions_to_authoritative_snapshot(
+                                    expected_positions_df=expected_positions_df,
+                                    authoritative_snapshot_df=snapshot_df,
+                                    snapshot_date=snapshot_ts,
+                                    effective_date=effective_ts,
+                                    assumed_price_map=assumed_price_map,
+                                    config=ReconciliationConfig(default_assumed_price=None),
+                                )
+
+                                if not between_trades_df.empty:
+                                    st.info(
+                                        f"Carried forward {len(between_trades_df)} trade receipt row(s) into the expected portfolio before reconciliation."
+                                    )
+
+                                _render_reconciliation_preview(
+                                    reconciliation_preview_df,
+                                    cash_preview_df,
+                                )
+                            else:
+                                st.info(
+                                    "No prior position state exists. This snapshot will be used as the initial seed."
+                                )
+
+                        if st.button("Save Snapshot", type="primary"):
+                            with session_scope() as session:
+                                result = _save_snapshot_with_reconciliation(
+                                    session=session,
+                                    snapshot_df=snapshot_df,
+                                    snapshot_ts=snapshot_ts,
+                                    uploaded_file_name=uploaded_file.name,
+                                    selected_sheet=metadata.get("selected_sheet"),
+                                )
+
+                            if result["mode"] == "initial_seed":
+                                st.success(
+                                    f"Saved {result['rows_saved']} snapshot rows for {snapshot_ts.date()}, "
+                                    f"and seeded {result['position_state_rows']} position-state rows."
+                                )
+                            else:
+                                st.success(
+                                    f"Saved {result['rows_saved']} snapshot rows for {snapshot_ts.date()}, "
+                                    f"applied {result['trade_rows_applied']} trade row(s), "
+                                    f"generated {result['reconciliation_rows']} reconciliation row(s), "
+                                    f"generated {result['cash_rows']} cash ledger row(s), "
+                                    f"and seeded {result['position_state_rows']} position-state rows."
+                                )
+
                 else:
-                    st.success(f"Saved {rows} trade rows.")
+                    norm = normalize_trade_receipt_and_tag_source(
+                        raw_df,
+                        source_file=uploaded_file.name,
+                        selected_sheet=metadata.get("selected_sheet", ""),
+                    )
+                    trades_df = norm["trades"]
+                    _render_mapping_notes(norm)
+                    st.dataframe(
+                        left_align_dataframe(_format_df_preview(trades_df)),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-    except (ValueError, KeyError, TypeError, RuntimeError) as exc:
-        st.error(f"Upload failed: {exc}")
+                    external_flow_df = _build_external_flow_entries_for_trade_upload(
+                        trades_df=trades_df,
+                        upload_type=upload_type,
+                    )
+                    if not external_flow_df.empty:
+                        st.subheader("External Cash Flow Preview")
+                        st.dataframe(
+                            left_align_dataframe(_format_df_preview(external_flow_df)),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
-        if uploaded_file is not None:
+                    if st.button("Save Trades", type="primary"):
+                        with session_scope() as session:
+                            rows = save_trade_receipts(
+                                session=session,
+                                trades_df=trades_df,
+                                source_file=uploaded_file.name,
+                                selected_sheet=metadata.get("selected_sheet"),
+                                replace_existing_for_source_file=True,
+                            )
+                            flow_rows = 0
+                            if not external_flow_df.empty:
+                                _delete_external_flow_entries_for_upload(
+                                    session=session,
+                                    external_flow_df=external_flow_df,
+                                )
+                                flow_rows = save_cash_ledger_entries(
+                                    session=session,
+                                    cash_df=external_flow_df,
+                                )
+                            log_upload_event(
+                                session=session,
+                                upload_type=upload_type,
+                                source_file=uploaded_file.name,
+                                selected_sheet=metadata.get("selected_sheet"),
+                                row_count=rows,
+                                status="success",
+                                message=f"Saved {rows} trade rows and {flow_rows} external cash-flow rows.",
+                            )
+
+                        if not external_flow_df.empty:
+                            st.success(f"Saved {rows} trade rows and {flow_rows} external cash-flow rows.")
+                        else:
+                            st.success(f"Saved {rows} trade rows.")
+
+        except (ValueError, KeyError, TypeError, RuntimeError) as exc:
+            st.error(f"Upload failed: {exc}")
+
             with session_scope() as session:
                 log_upload_event(
                     session=session,
@@ -728,12 +778,15 @@ def main() -> None:
                     message=str(exc),
                 )
 
-    finally:
-        if temp_path is not None and temp_path.exists():
-            try:
-                temp_path.unlink()
-            except Exception:
-                pass
+        finally:
+            if temp_path is not None and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+
+    st.divider()
+    _render_clear_uploads_action()
 
 
 if __name__ == "__main__":
