@@ -1,5 +1,5 @@
 """
-CMCSIF Portfolio Tracker - Main App Entry Point
+Dashboard Home - Main App Entry Point
 
 This is the landing page for the Streamlit app.
 
@@ -27,41 +27,10 @@ from src.utils.ui import apply_app_theme
 
 
 def render_header() -> None:
-    st.title("Fund Dashboard Home")
+    st.title("Dashboard Home")
     st.markdown(
         """
-        Welcome to the **Claremont McKenna Student Investment Fund Dashboard**.
-
-        This platform provides:
-        - Real-time portfolio tracking
-        - Team-level performance visibility
-        - Trade and activity monitoring
-        - Centralized portfolio data management
-        """
-    )
-    st.divider()
-
-
-def render_navigation_guide() -> None:
-    st.subheader("NAVIGATION GUIDE")
-    st.markdown(
-        """
-        **Core Pages:**
-
-        - **Total Fund View**  
-        View total portfolio AUM, allocation across teams, and top holdings.
-
-        - **Team View**  
-        Drill into each sector sleeve like Healthcare, TMT, and Consumer.
-
-        - **Holdings**  
-        Review the current portfolio with filters and position-level detail.
-
-        - **Portfolio Activity**  
-        Track trades, reconciliations, and cash movements over time.
-
-        - **Upload**  
-        Upload portfolio snapshots and trade receipts.
+        Welcome to the Claremont McKenna Student Investment Fund Dashboard.
         """
     )
     st.divider()
@@ -99,13 +68,13 @@ def render_quick_start() -> None:
     st.markdown(
         """
         **Step 1:** Upload a Portfolio Snapshot  
-        Go to **Upload** and add the latest file from the endowment office.
+        Go to **Upload** and add the latest portfolio snapshot.
 
         **Step 2:** Upload Trade Receipts  
-        Add monthly trades as they occur.
+        Add trade receipts as they occur to keep portfolio snapshot up-to-date.
 
         **Step 3:** Explore the Dashboard  
-        Monitor performance in **Total Fund View** and **Team View**.
+        Monitor performance in Portfolio View and Sector View.
         """
     )
     st.divider()
@@ -116,15 +85,15 @@ def render_notes() -> None:
         st.markdown(
             """
             - Portfolio state is reconstructed from snapshots plus trades
-            - Historical AUM charts currently reflect current holdings backfilled with prices
-            - Full historical position tracking will be added next
+            - This website is maintained by Kiefer Tierling. Contact me at kiefer.tierling@gmail.com
+            in the event of any bugs or outages.
             """
         )
 
 
 def main() -> None:
     st.set_page_config(
-        page_title="Fund Dashboard Home",
+        page_title="Dashboard Home",
         layout="wide",
     )
 
@@ -132,7 +101,6 @@ def main() -> None:
     init_db()
 
     render_header()
-    render_navigation_guide()
     render_system_status()
     render_quick_start()
     render_notes()

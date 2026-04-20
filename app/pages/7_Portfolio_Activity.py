@@ -34,82 +34,22 @@ from src.utils.ui import apply_app_theme, left_align_dataframe
 
 
 def _apply_portfolio_activity_filter_theme() -> None:
-    st.markdown(
-        """
-        <style>
-        [data-testid="stSidebar"] .stSelectbox label,
-        [data-testid="stSidebar"] .stSelectbox label p,
-        [data-testid="stSidebar"] .stMultiSelect label,
-        [data-testid="stSidebar"] .stMultiSelect label p,
-        [data-testid="stSidebar"] .stTextInput label,
-        [data-testid="stSidebar"] .stTextInput label p,
-        [data-testid="stSidebar"] [data-testid="stSelectbox"] label,
-        [data-testid="stSidebar"] [data-testid="stSelectbox"] label p,
-        [data-testid="stSidebar"] [data-testid="stMultiSelect"] label,
-        [data-testid="stSidebar"] [data-testid="stMultiSelect"] label p,
-        [data-testid="stSidebar"] [data-testid="stTextInput"] label,
-        [data-testid="stSidebar"] [data-testid="stTextInput"] label p {
-            color: #f8fafc !important;
-        }
-
-        [data-testid="stSidebar"] [data-baseweb="select"] > div,
-        [data-testid="stSidebar"] [data-baseweb="select"] > div > div,
-        [data-testid="stSidebar"] [data-baseweb="select"] div,
-        [data-testid="stSidebar"] [data-baseweb="select"] input,
-        [data-testid="stSidebar"] [data-baseweb="select"] span,
-        [data-testid="stSidebar"] [data-baseweb="select"] p,
-        [data-testid="stSidebar"] [data-baseweb="select"] svg,
-        [data-testid="stSidebar"] [role="combobox"],
-        [data-testid="stSidebar"] [role="listbox"],
-        [data-testid="stSidebar"] [role="option"],
-        [data-testid="stSidebar"] [data-baseweb="tag"] span,
-        [data-testid="stSidebar"] [data-baseweb="tag"] div,
-        [data-testid="stSidebar"] [data-baseweb="select"] [aria-selected="true"],
-        [data-testid="stSidebar"] [data-testid="stTextInput"] input,
-        [data-testid="stSidebar"] input {
-            color: #0f172a !important;
-            fill: #0f172a !important;
-        }
-
-        [data-testid="stSidebar"] [data-baseweb="select"] > div,
-        [data-testid="stSidebar"] [role="combobox"],
-        [data-testid="stSidebar"] [data-testid="stTextInput"] input,
-        [data-testid="stSidebar"] input,
-        [data-testid="stSidebar"] [data-baseweb="tag"] {
-            background: #f8fafc !important;
-            border-color: #cbd5e1 !important;
-        }
-
-        [data-testid="stSidebar"] [data-testid="stTextInput"] input::placeholder,
-        [data-testid="stSidebar"] [data-baseweb="select"] input::placeholder {
-            color: #334155 !important;
-            -webkit-text-fill-color: #334155 !important;
-        }
-
-        div[data-baseweb="popover"] [role="listbox"],
-        div[data-baseweb="popover"] [role="option"],
-        div[data-baseweb="popover"] [role="option"] div,
-        div[data-baseweb="popover"] [role="option"] span,
-        div[data-baseweb="popover"] [role="option"] p {
-            background: #f8fafc !important;
-            color: #0f172a !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    return None
 
 
 def _format_currency(value):
     if value is None or pd.isna(value):
         return "N/A"
-    return f"${value:,.2f}"
+    numeric_value = float(value)
+    return f"(${abs(numeric_value):,.2f})" if numeric_value < 0 else f"${numeric_value:,.2f}"
 
 
 def _format_number(value):
     if value is None or pd.isna(value):
         return "N/A"
-    return f"{value:,.2f}"
+    numeric_value = float(value)
+    formatted = f"{abs(numeric_value):,.2f}"
+    return f"({formatted})" if numeric_value < 0 else formatted
 
 
 def _prepare_activity_display(df: pd.DataFrame) -> pd.DataFrame:
@@ -232,7 +172,7 @@ def _render_filters(activity_df: pd.DataFrame) -> tuple[str, list[str], str]:
     fallback_teams = [team for team in teams if team not in ordered_teams]
     team_options = ["All"] + ordered_teams + sorted(fallback_teams)
 
-    selected_team = st.sidebar.selectbox("Team", options=team_options)
+    selected_team = st.sidebar.selectbox("Pod", options=team_options)
 
     activity_type_options = []
     if "activity_type" in activity_df.columns:
@@ -292,7 +232,7 @@ def main() -> None:
         columns={
             "activity_date": "ACTIVITY DATE",
             "activity_type": "ACTIVITY TYPE",
-            "team": "TEAM",
+            "team": "POD",
             "ticker": "TICKER",
             "position_side": "POSITION SIDE",
             "quantity": "QUANTITY",
@@ -306,7 +246,7 @@ def main() -> None:
     preferred_columns = [
         "ACTIVITY DATE",
         "ACTIVITY TYPE",
-        "TEAM",
+        "POD",
         "TICKER",
         "POSITION SIDE",
         "QUANTITY",

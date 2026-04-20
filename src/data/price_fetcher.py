@@ -13,6 +13,8 @@ Uses yfinance for MVP purposes.
 from __future__ import annotations
 
 import os
+import json
+import hashlib
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -33,6 +35,47 @@ def _cache_path_for_ticker(ticker: str) -> Path:
     """
     safe_ticker = ticker.replace("/", "-")
     return settings.cache_dir / f"{safe_ticker}.csv"
+
+
+def _cache_path_for_named_payload(name: str, suffix: str) -> Path:
+    safe_name = str(name).strip().replace("/", "-").replace("\\", "-")
+    return settings.cache_dir / f"{safe_name}{suffix}"
+
+
+def _read_json_cache(cache_path: Path):
+    try:
+        if cache_path.exists():
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return None
+
+
+def _write_json_cache(cache_path: Path, payload) -> None:
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _read_price_cache(cache_path: Path) -> pd.DataFrame:
+    try:
+        if cache_path.exists():
+            return pd.read_csv(cache_path, parse_dates=["date"])
+    except Exception:
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _write_price_cache(cache_path: Path, df: pd.DataFrame) -> None:
+    try:
+        if df.empty:
+            return
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(cache_path, index=False)
+    except Exception:
+        pass
 
 
 @contextmanager
@@ -89,6 +132,15 @@ def _is_cache_fresh(file_path: Path, max_age_seconds: int) -> bool:
     return age < max_age_seconds
 
 
+def _cache_covers_start_date(df: pd.DataFrame, start_date: datetime) -> bool:
+    if df.empty or "date" not in df.columns:
+        return False
+    dates = pd.to_datetime(df["date"], errors="coerce").dropna()
+    if dates.empty:
+        return False
+    return dates.min() <= pd.Timestamp(start_date).normalize()
+
+
 def _normalize_yfinance_history_frame(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """
     Normalize a yfinance history frame to the app's canonical schema.
@@ -122,6 +174,166 @@ def _normalize_yfinance_history_frame(df: pd.DataFrame, ticker: str) -> pd.DataF
     return normalized[["date", "ticker", "close", "adj_close"]]
 
 
+def _normalize_sector_key(key: str) -> str:
+    return (
+        str(key)
+        .strip()
+        .lower()
+        .replace("&", "and")
+        .replace("-", " ")
+        .replace("/", " ")
+        .replace("_", " ")
+    )
+
+
+def _coerce_sector_weightings(raw_sector_weightings) -> Dict[str, float]:
+    """
+    Normalize yfinance fund sector weightings to a simple dict of float weights.
+    """
+    if raw_sector_weightings is None:
+        return {}
+
+    if isinstance(raw_sector_weightings, dict):
+        items = raw_sector_weightings.items()
+    elif isinstance(raw_sector_weightings, pd.Series):
+        items = raw_sector_weightings.to_dict().items()
+    elif isinstance(raw_sector_weightings, pd.DataFrame):
+        working = raw_sector_weightings.copy()
+        if working.empty:
+            return {}
+
+        if {"sector", "weight"}.issubset(working.columns):
+            items = zip(working["sector"], working["weight"])
+        elif working.shape[1] >= 2:
+            items = zip(working.iloc[:, 0], working.iloc[:, 1])
+        else:
+            return {}
+    elif isinstance(raw_sector_weightings, list):
+        items = []
+        for row in raw_sector_weightings:
+            if isinstance(row, dict):
+                sector = row.get("sector", row.get("name", row.get("label")))
+                weight = row.get("weight", row.get("value"))
+                items.append((sector, weight))
+    else:
+        return {}
+
+    normalized: Dict[str, float] = {}
+    for key, value in items:
+        numeric_value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.isna(numeric_value):
+            continue
+        normalized[_normalize_sector_key(str(key))] = float(numeric_value)
+
+    return normalized
+
+
+def fetch_sp500_sector_group_weights() -> Dict[str, float | None]:
+    """
+    Fetch live S&P 500 sector weights from SPY's reported sector exposure and
+    aggregate them into the portfolio's pod buckets.
+
+    We use SPY as a practical live proxy for current S&P 500 sector weights.
+    """
+    default_result: Dict[str, float | None] = {
+        "Consumer": None,
+        "E&U": None,
+        "F&R": None,
+        "Healthcare": None,
+        "TMT": None,
+        "M&I": None,
+        "Cash": 0.0,
+    }
+    cache_path = _cache_path_for_named_payload("sp500_sector_group_weights", ".json")
+    cached = _read_json_cache(cache_path)
+    if _is_cache_fresh(cache_path, settings.price_refresh_interval_seconds):
+        return cached if isinstance(cached, dict) and cached else default_result
+
+    try:
+        with _yfinance_request_context():
+            raw_sector_weightings = yf.Ticker("SPY").funds_data.sector_weightings
+    except Exception:
+        return cached if isinstance(cached, dict) and cached else default_result
+
+    sector_weights = _coerce_sector_weightings(raw_sector_weightings)
+    if not sector_weights:
+        return cached if isinstance(cached, dict) and cached else default_result
+
+    aliases = {
+        "materials": [
+            "basic materials",
+            "materials",
+        ],
+        "industrials": [
+            "industrials",
+        ],
+        "financials": [
+            "financial services",
+            "financials",
+        ],
+        "real_estate": [
+            "real estate",
+        ],
+        "consumer_cyclical": [
+            "consumer cyclical",
+            "consumer discretionary",
+        ],
+        "consumer_defensive": [
+            "consumer defensive",
+            "consumer staples",
+        ],
+        "utilities": [
+            "utilities",
+        ],
+        "energy": [
+            "energy",
+        ],
+        "healthcare": [
+            "healthcare",
+            "health care",
+        ],
+        "communication_services": [
+            "communication services",
+            "communications",
+        ],
+        "technology": [
+            "technology",
+            "information technology",
+        ],
+    }
+
+    def _sector_weight(*sector_names: str) -> float:
+        total = 0.0
+        found_any = False
+        for sector_name in sector_names:
+            for alias in aliases.get(sector_name, []):
+                alias_key = _normalize_sector_key(alias)
+                if alias_key in sector_weights:
+                    total += float(sector_weights[alias_key])
+                    found_any = True
+                    break
+        return total if found_any else float("nan")
+
+    result: Dict[str, float | None] = {
+        "Consumer": _sector_weight("consumer_cyclical", "consumer_defensive"),
+        "E&U": _sector_weight("utilities", "energy"),
+        "F&R": _sector_weight("financials", "real_estate"),
+        "Healthcare": _sector_weight("healthcare"),
+        "TMT": _sector_weight("communication_services", "technology"),
+        "M&I": _sector_weight("materials", "industrials"),
+        "Cash": 0.0,
+    }
+
+    for team, value in list(result.items()):
+        if pd.isna(value):
+            result[team] = None
+
+    if any(value is not None for key, value in result.items() if key != "Cash"):
+        _write_json_cache(cache_path, result)
+
+    return result
+
+
 # ---------------------------------------------------------------------
 # Latest price fetching
 # ---------------------------------------------------------------------
@@ -138,6 +350,22 @@ def fetch_latest_prices(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]]:
     tickers = list(set([t for t in tickers if isinstance(t, str) and t.strip() != ""]))
     if not tickers:
         return pd.DataFrame(columns=["ticker", "price", "timestamp"]), []
+    tickers = sorted(tickers)
+    ticker_hash = hashlib.sha1(json.dumps(tickers).encode("utf-8")).hexdigest()
+    cache_key = _cache_path_for_named_payload(
+        f"latest_prices_{ticker_hash}",
+        ".json",
+    )
+    if _is_cache_fresh(cache_key, settings.price_refresh_interval_seconds):
+        cached = _read_json_cache(cache_key)
+        if isinstance(cached, dict):
+            prices_payload = cached.get("prices", [])
+            failed_payload = cached.get("failed_tickers", [])
+            cached_df = pd.DataFrame(prices_payload)
+            if not cached_df.empty and "timestamp" in cached_df.columns:
+                cached_df["timestamp"] = pd.to_datetime(cached_df["timestamp"], errors="coerce")
+            if not cached_df.empty or failed_payload:
+                return cached_df, list(failed_payload)
 
     with _yfinance_request_context():
         data = yf.download(
@@ -171,6 +399,21 @@ def fetch_latest_prices(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]]:
             failed_tickers.append(ticker)
 
     prices_df = pd.DataFrame(results)
+    if not prices_df.empty or failed_tickers:
+        _write_json_cache(
+            cache_key,
+            {
+                "prices": [
+                    {
+                        "ticker": row["ticker"],
+                        "price": row["price"],
+                        "timestamp": pd.Timestamp(row["timestamp"]).isoformat(),
+                    }
+                    for row in results
+                ],
+                "failed_tickers": failed_tickers,
+            },
+        )
     return prices_df, failed_tickers
 
 
@@ -192,16 +435,14 @@ def fetch_price_history(
         lookback_days = settings.history_lookback_days
 
     cache_path = _cache_path_for_ticker(ticker)
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=lookback_days)
 
     # Use cache if available and fresh
     if use_cache and _is_cache_fresh(cache_path, settings.price_refresh_interval_seconds):
-        try:
-            return pd.read_csv(cache_path, parse_dates=["date"])
-        except Exception:
-            pass  # fall back to fetching
-
-    end_date = datetime.utcnow()
-    start_date = end_date - timedelta(days=lookback_days)
+        cached = _read_price_cache(cache_path)
+        if _cache_covers_start_date(cached, start_date):
+            return cached
 
     try:
         with _yfinance_request_context():
@@ -217,13 +458,7 @@ def fetch_price_history(
             return pd.DataFrame(columns=["date", "ticker", "close", "adj_close"])
 
         df = _normalize_yfinance_history_frame(df, ticker)
-
-        # Save to cache
-        try:
-            settings.cache_dir.mkdir(parents=True, exist_ok=True)
-            df.to_csv(cache_path, index=False)
-        except Exception:
-            pass
+        _write_price_cache(cache_path, df)
 
         return df
 
@@ -271,14 +506,26 @@ def fetch_multiple_price_histories(
     if not cleaned:
         return pd.DataFrame(columns=["date", "ticker", "close", "adj_close"])
 
-    # --- Fetch in batch ---
     end_date = datetime.utcnow()
     start_date = end_date - timedelta(days=lookback_days or settings.history_lookback_days)
+    cached_frames: list[pd.DataFrame] = []
+    missing_tickers: list[str] = []
+
+    for ticker in cleaned:
+        cache_path = _cache_path_for_ticker(ticker)
+        cached = _read_price_cache(cache_path) if _is_cache_fresh(cache_path, settings.price_refresh_interval_seconds) else pd.DataFrame()
+        if _cache_covers_start_date(cached, start_date):
+            cached_frames.append(cached)
+        else:
+            missing_tickers.append(ticker)
+
+    if not missing_tickers:
+        return pd.concat(cached_frames, ignore_index=True) if cached_frames else pd.DataFrame(columns=["date", "ticker", "close", "adj_close"])
 
     try:
         with _yfinance_request_context():
             data = yf.download(
-                tickers=cleaned,
+                tickers=missing_tickers,
                 start=start_date.strftime("%Y-%m-%d"),
                 end=end_date.strftime("%Y-%m-%d"),
                 interval="1d",
@@ -288,27 +535,31 @@ def fetch_multiple_price_histories(
     except Exception:
         return pd.DataFrame(columns=["date", "ticker", "close", "adj_close"])
 
-    frames = []
+    frames = list(cached_frames)
 
     # --- Handle single vs multi ticker structure ---
-    if len(cleaned) == 1:
-        ticker = cleaned[0]
+    if len(missing_tickers) == 1:
+        ticker = missing_tickers[0]
         df = data.copy()
 
         if df.empty:
-            return pd.DataFrame(columns=["date", "ticker", "close", "adj_close"])
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["date", "ticker", "close", "adj_close"])
 
-        frames.append(_normalize_yfinance_history_frame(df, ticker))
+        normalized = _normalize_yfinance_history_frame(df, ticker)
+        _write_price_cache(_cache_path_for_ticker(ticker), normalized)
+        frames.append(normalized)
 
     else:
-        for ticker in cleaned:
+        for ticker in missing_tickers:
             try:
                 df = data[ticker].copy()
 
                 if df.empty:
                     continue
 
-                frames.append(_normalize_yfinance_history_frame(df, ticker))
+                normalized = _normalize_yfinance_history_frame(df, ticker)
+                _write_price_cache(_cache_path_for_ticker(ticker), normalized)
+                frames.append(normalized)
 
             except Exception:
                 continue
@@ -316,7 +567,12 @@ def fetch_multiple_price_histories(
     if not frames:
         return pd.DataFrame(columns=["date", "ticker", "close", "adj_close"])
 
-    return pd.concat(frames, ignore_index=True)
+    combined = pd.concat(frames, ignore_index=True)
+    if combined.empty:
+        return pd.DataFrame(columns=["date", "ticker", "close", "adj_close"])
+    combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
+    combined = combined.dropna(subset=["date", "ticker"]).drop_duplicates(subset=["date", "ticker"], keep="last")
+    return combined.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------

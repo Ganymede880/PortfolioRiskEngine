@@ -92,6 +92,18 @@ def _normalized_columns(df: pd.DataFrame) -> set[str]:
     return {str(col).strip().lower() for col in df.columns}
 
 
+def infer_upload_type_from_filename(file_path: str | Path) -> str | None:
+    """
+    Infer a more specific trade-like upload type from the filename when possible.
+    """
+    stem = Path(file_path).stem.strip().lower()
+    if "liquidation" in stem:
+        return "portfolio_liquidation"
+    if "rebalance" in stem:
+        return "sector_rebalance"
+    return None
+
+
 # ============================================================================
 # Upload type detection / scoring
 # ============================================================================
@@ -362,6 +374,9 @@ def load_uploaded_file_auto(file_path: str | Path) -> Tuple[pd.DataFrame, Dict[s
         raw_df = load_csv_file(file_path)
         df = clean_raw_dataframe(raw_df)
         detected_type = detect_upload_type_from_dataframe(df)
+        filename_override = infer_upload_type_from_filename(file_path)
+        if filename_override is not None and detected_type == "trade_receipt":
+            detected_type = filename_override
 
         metadata = {
             "file_path": str(file_path),
@@ -373,6 +388,9 @@ def load_uploaded_file_auto(file_path: str | Path) -> Tuple[pd.DataFrame, Dict[s
 
     if extension in {".xlsx", ".xls"}:
         sheet_name, df, detected_type = choose_best_excel_sheet_auto(file_path)
+        filename_override = infer_upload_type_from_filename(file_path)
+        if filename_override is not None and detected_type == "trade_receipt":
+            detected_type = filename_override
         metadata = {
             "file_path": str(file_path),
             "file_type": "excel",

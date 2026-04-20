@@ -26,6 +26,7 @@ from tempfile import NamedTemporaryFile
 import pandas as pd
 import streamlit as st
 from sqlalchemy import delete
+from sqlalchemy import tuple_
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -39,6 +40,7 @@ from src.data.normalizers import (
 from src.data.validators import validate_uploaded_dataframe
 from src.db.crud import (
     get_latest_position_state_date,
+    load_cash_ledger,
     load_position_state,
     load_trade_receipts,
     log_upload_event,
@@ -52,64 +54,16 @@ from src.db.models import CashLedger, ReconciliationEvent
 from src.db.session import session_scope
 from src.analytics.ledger import (
     ReconciliationConfig,
+    apply_cash_ledger_entries_to_positions,
     apply_trades_to_positions,
+    derive_trade_cash_amount,
     reconcile_expected_positions_to_authoritative_snapshot,
 )
 from src.utils.ui import apply_app_theme, left_align_dataframe
 
 
 def _apply_upload_control_theme() -> None:
-    st.markdown(
-        """
-        <style>
-        [data-testid="stFileUploader"] section,
-        [data-testid="stFileUploaderDropzone"] {
-            background: rgba(248, 250, 252, 0.98) !important;
-            color: #0f172a !important;
-            border-color: #cbd5e1 !important;
-        }
-
-        [data-testid="stFileUploader"] div,
-        [data-testid="stFileUploader"] span,
-        [data-testid="stFileUploader"] small,
-        [data-testid="stFileUploader"] p,
-        [data-testid="stFileUploaderDropzone"] div,
-        [data-testid="stFileUploaderDropzone"] span,
-        [data-testid="stFileUploaderDropzone"] small,
-        [data-testid="stFileUploaderDropzone"] p,
-        [data-testid="stFileUploaderDropzoneInstructions"] span,
-        [data-testid="stFileUploaderDropzoneInstructions"] small,
-        [data-testid="stFileUploaderDropzoneInstructions"] p {
-            color: #0f172a !important;
-        }
-
-        [data-testid="stFileUploader"] button,
-        [data-testid="stFileUploaderDropzone"] button,
-        [data-testid="stBaseButton-secondary"],
-        [data-testid="stBaseButton-primary"] {
-            background: #f8fafc !important;
-            color: #0f172a !important;
-            border-color: #cbd5e1 !important;
-        }
-
-        [data-testid="stBaseButton-primary"] *,
-        [data-testid="stBaseButton-secondary"] *,
-        .stButton button,
-        .stButton button *,
-        .stDownloadButton button,
-        .stDownloadButton button * {
-            color: #0f172a !important;
-            fill: #0f172a !important;
-        }
-
-        [data-testid="stRadio"] label,
-        [data-testid="stRadio"] label p {
-            color: #f8fafc !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    return None
 
 
 def _save_uploaded_file_temporarily(uploaded_file) -> Path:
@@ -156,7 +110,7 @@ def _render_mapping_notes(normalization_result: dict) -> None:
 
     if unmapped_teams:
         st.warning(
-            "Unmapped team/sector labels detected: "
+            "Unmapped pod/sector labels detected: "
             + ", ".join(sorted(set(unmapped_teams)))
         )
 
@@ -233,14 +187,85 @@ def _build_expected_positions_for_snapshot(
         start_date=latest_state_date + pd.Timedelta(days=1),
         end_date=snapshot_ts.date(),
     )
-    if between_trades_df.empty:
-        return expected_positions_df, between_trades_df
-
-    carried_positions_df, _ = apply_trades_to_positions(
-        base_positions_df=expected_positions_df,
-        trades_df=between_trades_df,
+    between_cash_df = load_cash_ledger(
+        session=session,
+        start_date=latest_state_date + pd.Timedelta(days=1),
+        end_date=snapshot_ts.date(),
     )
+
+    carried_positions_df = expected_positions_df.copy()
+    if not between_trades_df.empty:
+        carried_positions_df, _ = apply_trades_to_positions(
+            base_positions_df=carried_positions_df,
+            trades_df=between_trades_df,
+        )
+
+    non_reconciliation_cash_df = between_cash_df.loc[
+        between_cash_df["activity_type"].astype(str).ne("RECONCILIATION")
+    ].copy() if not between_cash_df.empty else pd.DataFrame()
+    if not non_reconciliation_cash_df.empty:
+        carried_positions_df = apply_cash_ledger_entries_to_positions(
+            positions_df=carried_positions_df,
+            cash_entries_df=non_reconciliation_cash_df,
+        )
+
     return carried_positions_df, between_trades_df
+
+
+def _build_external_flow_entries_for_trade_upload(
+    trades_df: pd.DataFrame,
+    upload_type: str,
+) -> pd.DataFrame:
+    """
+    Build external cash-flow ledger rows for rebalance/liquidation uploads.
+    """
+    if trades_df.empty or upload_type not in {"sector_rebalance", "portfolio_liquidation"}:
+        return pd.DataFrame(
+            columns=["activity_date", "team", "amount", "activity_type", "reference_type", "reference_id", "note"]
+        )
+
+    flow_type = "SECTOR_REBALANCE" if upload_type == "sector_rebalance" else "PORTFOLIO_LIQUIDATION"
+    rows = []
+    for _, row in trades_df.iterrows():
+        activity_date = pd.to_datetime(
+            row.get("settlement_date", row.get("trade_date")),
+            errors="coerce",
+        )
+        if pd.isna(activity_date):
+            continue
+
+        trade_cash_amount = derive_trade_cash_amount(row)
+        external_flow_amount = -float(trade_cash_amount)
+        if abs(external_flow_amount) < 1e-9:
+            continue
+
+        trade_side = str(row.get("trade_side", "")).strip().upper()
+        ticker = str(row.get("ticker", "")).strip().upper()
+        quantity = float(pd.to_numeric(pd.Series([row.get("quantity")]), errors="coerce").fillna(0.0).iloc[0])
+        gross_price = float(pd.to_numeric(pd.Series([row.get("gross_price")]), errors="coerce").fillna(0.0).iloc[0])
+        rows.append(
+            {
+                "activity_date": activity_date.date(),
+                "team": str(row.get("team", "")).strip(),
+                "amount": external_flow_amount,
+                "activity_type": flow_type,
+                "reference_type": flow_type,
+                "reference_id": None,
+                "note": f"{flow_type.replace('_', ' ').title()} offset for {trade_side} {quantity:,.2f} {ticker} @ {gross_price:,.4f}",
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["activity_date", "team", "amount", "activity_type", "reference_type", "reference_id", "note"]
+        )
+
+    flows_df = pd.DataFrame(rows)
+    return (
+        flows_df.groupby(["activity_date", "team", "activity_type", "reference_type", "note"], dropna=False, as_index=False)
+        .agg(amount=("amount", "sum"))
+        [["activity_date", "team", "amount", "activity_type", "reference_type", "note"]]
+    )
 
 
 def _delete_reconciliation_artifacts_for_snapshot(
@@ -257,6 +282,35 @@ def _delete_reconciliation_artifacts_for_snapshot(
         delete(CashLedger).where(
             CashLedger.activity_date == pd.to_datetime(effective_date).date(),
             CashLedger.activity_type == "RECONCILIATION",
+        )
+    )
+    session.flush()
+
+
+def _delete_external_flow_entries_for_upload(
+    session,
+    external_flow_df: pd.DataFrame,
+) -> None:
+    if external_flow_df.empty:
+        return
+
+    working = external_flow_df.copy()
+    working["activity_date"] = pd.to_datetime(working["activity_date"], errors="coerce").dt.date
+    working["team"] = working["team"].astype(str).str.strip()
+    working["activity_type"] = working["activity_type"].astype(str).str.strip().str.upper()
+    working = working.dropna(subset=["activity_date", "team", "activity_type"]).copy()
+    if working.empty:
+        return
+
+    keys = list(
+        {
+            (row["activity_date"], row["team"], row["activity_type"])
+            for _, row in working.iterrows()
+        }
+    )
+    session.execute(
+        delete(CashLedger).where(
+            tuple_(CashLedger.activity_date, CashLedger.team, CashLedger.activity_type).in_(keys)
         )
     )
     session.flush()
@@ -447,7 +501,7 @@ def main() -> None:
 
     st.write(
         """
-        Upload a **Portfolio Snapshot** or **Trade Receipt** file.
+        Upload a **Portfolio Snapshot**, **Trade Receipt**, **Sector Rebalance**, or **Portfolio Liquidation** file.
 
         The system will:
         - auto-detect file type (or you can override)
@@ -488,10 +542,15 @@ def main() -> None:
             st.dataframe(left_align_dataframe(preview_df), use_container_width=True, hide_index=True)
 
         st.subheader("Upload Type")
+        trade_like_options = ["snapshot", "trade_receipt", "sector_rebalance", "portfolio_liquidation"]
+        default_index = 0
+        detected_upload_type = detected_type or "unknown"
+        if detected_upload_type in trade_like_options:
+            default_index = trade_like_options.index(detected_upload_type)
         upload_type = st.radio(
             "Select upload type",
-            options=["snapshot", "trade_receipt"],
-            index=0 if detected_type == "snapshot" else 1 if detected_type == "trade_receipt" else 0,
+            options=trade_like_options,
+            index=default_index,
             horizontal=True,
         )
 
@@ -608,6 +667,18 @@ def main() -> None:
                 hide_index=True,
             )
 
+            external_flow_df = _build_external_flow_entries_for_trade_upload(
+                trades_df=trades_df,
+                upload_type=upload_type,
+            )
+            if not external_flow_df.empty:
+                st.subheader("External Cash Flow Preview")
+                st.dataframe(
+                    left_align_dataframe(_format_df_preview(external_flow_df)),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
             if st.button("Save Trades", type="primary"):
                 with session_scope() as session:
                     rows = save_trade_receipts(
@@ -617,17 +688,30 @@ def main() -> None:
                         selected_sheet=metadata.get("selected_sheet"),
                         replace_existing_for_source_file=True,
                     )
+                    flow_rows = 0
+                    if not external_flow_df.empty:
+                        _delete_external_flow_entries_for_upload(
+                            session=session,
+                            external_flow_df=external_flow_df,
+                        )
+                        flow_rows = save_cash_ledger_entries(
+                            session=session,
+                            cash_df=external_flow_df,
+                        )
                     log_upload_event(
                         session=session,
-                        upload_type="trade_receipt",
+                        upload_type=upload_type,
                         source_file=uploaded_file.name,
                         selected_sheet=metadata.get("selected_sheet"),
                         row_count=rows,
                         status="success",
-                        message=f"Saved {rows} trade rows.",
+                        message=f"Saved {rows} trade rows and {flow_rows} external cash-flow rows.",
                     )
 
-                st.success(f"Saved {rows} trade rows.")
+                if not external_flow_df.empty:
+                    st.success(f"Saved {rows} trade rows and {flow_rows} external cash-flow rows.")
+                else:
+                    st.success(f"Saved {rows} trade rows.")
 
     except (ValueError, KeyError, TypeError, RuntimeError) as exc:
         st.error(f"Upload failed: {exc}")

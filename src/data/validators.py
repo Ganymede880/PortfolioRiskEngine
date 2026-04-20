@@ -341,7 +341,7 @@ def validate_uploaded_dataframe(
     if upload_type == "snapshot":
         return validate_snapshot_dataframe(df)
 
-    if upload_type == "trade_receipt":
+    if upload_type in {"trade_receipt", "sector_rebalance", "portfolio_liquidation"}:
         return validate_trade_receipt_dataframe(df)
 
     return {

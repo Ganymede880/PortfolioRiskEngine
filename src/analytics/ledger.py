@@ -127,7 +127,11 @@ def _standardize_trade_frame(trades_df: pd.DataFrame) -> pd.DataFrame:
 
     df = trades_df.copy()
 
-    for col in ["team", "ticker", "trade_side"]:
+    if "team" not in df.columns:
+        df["team"] = pd.NA
+    df["team"] = df["team"].astype(str).str.strip()
+
+    for col in ["ticker", "trade_side"]:
         if col not in df.columns:
             df[col] = pd.NA
         df[col] = df[col].astype(str).str.strip().str.upper()
@@ -409,6 +413,43 @@ def apply_trades_to_positions(
         cash_entries.append(cash_entry)
 
     return positions.reset_index(drop=True), pd.DataFrame(cash_entries)
+
+
+def apply_cash_ledger_entries_to_positions(
+    positions_df: pd.DataFrame,
+    cash_entries_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Apply non-trade cash ledger entries to position state.
+
+    This is used for external capital flows like sector rebalances and
+    portfolio liquidations, where cash should move without directly changing
+    security positions.
+    """
+    positions = _standardize_position_frame(positions_df)
+
+    if cash_entries_df.empty:
+        return positions
+
+    working = cash_entries_df.copy()
+    if "team" not in working.columns or "amount" not in working.columns:
+        return positions
+
+    working["team"] = working["team"].astype(str).str.strip()
+    working["amount"] = pd.to_numeric(working["amount"], errors="coerce")
+    working = working.dropna(subset=["team", "amount"]).reset_index(drop=True)
+    if working.empty:
+        return positions
+
+    for _, row in working.iterrows():
+        positions = _apply_cash_change(
+            positions_df=positions,
+            team=str(row["team"]).strip(),
+            amount=float(row["amount"]),
+            note_reconciled=False,
+        )
+
+    return positions.reset_index(drop=True)
 
 
 # ============================================================================

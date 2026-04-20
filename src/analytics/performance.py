@@ -29,6 +29,95 @@ def _clean_return_series(return_series: pd.Series) -> pd.Series:
     return pd.to_numeric(return_series, errors="coerce").dropna()
 
 
+def prepare_flow_adjusted_history(
+    history_df: pd.DataFrame,
+    value_column: str,
+    flow_column: str = "net_external_flow",
+) -> pd.DataFrame:
+    """
+    Prepare a dated history with flow-adjusted daily P&L and returns.
+
+    Conventions:
+    - external flow > 0 means capital added to the sleeve/fund
+    - external flow < 0 means capital withdrawn from the sleeve/fund
+    - performance P&L removes those external flows from the change in AUM
+    """
+    if history_df.empty or value_column not in history_df.columns:
+        return pd.DataFrame(
+            columns=[
+                "date",
+                value_column,
+                flow_column,
+                "previous_value",
+                "performance_pnl",
+                "performance_return",
+            ]
+        )
+
+    df = history_df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df[value_column] = pd.to_numeric(df[value_column], errors="coerce")
+    if flow_column not in df.columns:
+        df[flow_column] = 0.0
+    df[flow_column] = pd.to_numeric(df[flow_column], errors="coerce").fillna(0.0)
+    df = df.dropna(subset=["date", value_column]).sort_values("date").reset_index(drop=True)
+
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "date",
+                value_column,
+                flow_column,
+                "previous_value",
+                "performance_pnl",
+                "performance_return",
+            ]
+        )
+
+    df["previous_value"] = pd.to_numeric(df[value_column], errors="coerce").shift(1)
+    df["performance_pnl"] = (
+        pd.to_numeric(df[value_column], errors="coerce").diff()
+        - pd.to_numeric(df[flow_column], errors="coerce").fillna(0.0)
+    )
+
+    df["performance_return"] = np.where(
+        df["previous_value"].notna() & df["previous_value"].ne(0),
+        ((pd.to_numeric(df[value_column], errors="coerce") - pd.to_numeric(df[flow_column], errors="coerce").fillna(0.0)) / df["previous_value"]) - 1.0,
+        np.nan,
+    )
+    df["performance_return"] = pd.to_numeric(df["performance_return"], errors="coerce")
+
+    return df
+
+
+def build_flow_adjusted_benchmark_series(
+    benchmark_return_series: pd.Series,
+    external_flow_series: pd.Series,
+    initial_value: float,
+) -> pd.Series:
+    """
+    Build a benchmark AUM series that absorbs the same external cash flows.
+    """
+    benchmark_returns = pd.to_numeric(benchmark_return_series, errors="coerce")
+    external_flows = pd.to_numeric(external_flow_series, errors="coerce").fillna(0.0)
+
+    if benchmark_returns.empty:
+        return pd.Series(dtype="float64")
+
+    values: list[float] = []
+    current_value = float(initial_value)
+
+    for idx, ret in benchmark_returns.items():
+        flow = float(external_flows.get(idx, 0.0)) if hasattr(external_flows, "get") else 0.0
+        if pd.isna(ret):
+            values.append(np.nan)
+            continue
+        current_value = (current_value * (1.0 + float(ret))) + flow
+        values.append(float(current_value))
+
+    return pd.Series(values, index=benchmark_returns.index, dtype="float64")
+
+
 def compute_annualized_volatility(return_series: pd.Series) -> float:
     """
     Compute annualized volatility from a daily return series.

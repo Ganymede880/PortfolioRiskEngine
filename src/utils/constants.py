@@ -6,7 +6,7 @@ dependent. This helps avoid hardcoding strings in multiple places and keeps
 the codebase consistent and readable.
 """
 
-from typing import List, Dict
+from typing import Dict, List
 
 
 # ---------------------------------------------------------------------
@@ -63,6 +63,28 @@ SUPPORTED_FACTORS: List[str] = [
     FACTOR_VALUE,
     FACTOR_MOMENTUM,
 ]
+
+
+# ---------------------------------------------------------------------
+# Shared chart palettes
+# ---------------------------------------------------------------------
+TEAM_COLORS: Dict[str, str] = {
+    "Consumer": "#C6D4FF",
+    "E&U": "#7A82AB",
+    "F&R": "#307473",
+    "Healthcare": "#12664F",
+    "TMT": "#2DC2BD",
+    "M&I": "#3F3047",
+    "Cash": "#7A82AB",
+}
+
+FACTOR_COLORS: Dict[str, str] = {
+    "Market": TEAM_COLORS["Healthcare"],
+    "Size": TEAM_COLORS["E&U"],
+    "Momentum": TEAM_COLORS["TMT"],
+    "Value": TEAM_COLORS["F&R"],
+    "Idiosyncratic": TEAM_COLORS["M&I"],
+}
 
 
 # ---------------------------------------------------------------------

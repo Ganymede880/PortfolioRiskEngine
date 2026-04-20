@@ -38,6 +38,7 @@ COL_MARKET_VALUE = "market_value"
 COL_WEIGHT = "weight"
 COL_COST_BASIS_PER_SHARE = "cost_basis_per_share"
 COL_TOTAL_COST_BASIS = "total_cost_basis"
+CASH_LIKE_TICKERS = {"CASH", "EUR", "GBP", "NOGXX"}
 
 
 # ============================================================================
@@ -144,8 +145,12 @@ def attach_latest_prices_to_positions(
         how="left",
     )
 
-    # Cash should be priced at 1
-    cash_mask = merged[COL_POSITION_SIDE].eq("CASH") | merged[COL_TICKER].eq("CASH")
+    # Cash-like rows should be priced at 1
+    cash_mask = (
+        merged[COL_POSITION_SIDE].astype(str).str.upper().eq("CASH")
+        | merged[COL_TICKER].astype(str).str.upper().isin(CASH_LIKE_TICKERS)
+        | merged[COL_TEAM].astype(str).str.upper().eq("CASH")
+    )
     merged.loc[cash_mask, COL_PRICE] = 1.0
 
     # Market value convention:
@@ -156,7 +161,11 @@ def attach_latest_prices_to_positions(
 
     long_mask = merged[COL_POSITION_SIDE].eq("LONG")
     short_mask = merged[COL_POSITION_SIDE].eq("SHORT")
-    cash_mask = merged[COL_POSITION_SIDE].eq("CASH") | merged[COL_TICKER].eq("CASH")
+    cash_mask = (
+        merged[COL_POSITION_SIDE].astype(str).str.upper().eq("CASH")
+        | merged[COL_TICKER].astype(str).str.upper().isin(CASH_LIKE_TICKERS)
+        | merged[COL_TEAM].astype(str).str.upper().eq("CASH")
+    )
 
     merged.loc[long_mask, COL_MARKET_VALUE] = (
         pd.to_numeric(merged.loc[long_mask, COL_SHARES], errors="coerce")
@@ -260,8 +269,9 @@ def summarize_total_portfolio(position_snapshot_df: pd.DataFrame) -> Dict[str, A
     prices = pd.to_numeric(position_snapshot_df[COL_PRICE], errors="coerce")
 
     cash_mask = (
-        position_snapshot_df[COL_POSITION_SIDE].eq("CASH")
-        | position_snapshot_df[COL_TICKER].eq("CASH")
+        position_snapshot_df[COL_POSITION_SIDE].astype(str).str.upper().eq("CASH")
+        | position_snapshot_df[COL_TICKER].astype(str).str.upper().isin(CASH_LIKE_TICKERS)
+        | position_snapshot_df[COL_TEAM].astype(str).str.upper().eq("CASH")
     )
 
     gross_exposure = market_values.abs().sum(skipna=True)
@@ -286,7 +296,7 @@ def find_unpriced_positions(position_snapshot_df: pd.DataFrame) -> List[str]:
 
     mask = (
         position_snapshot_df[COL_PRICE].isna()
-        & ~position_snapshot_df[COL_TICKER].eq("CASH")
+        & ~position_snapshot_df[COL_TICKER].astype(str).str.upper().isin(CASH_LIKE_TICKERS)
     )
 
     return sorted(
@@ -365,7 +375,11 @@ def attach_historical_prices_to_position_state(
 
     merged = merged.rename(columns={price_col: COL_PRICE})
 
-    cash_mask = merged[COL_POSITION_SIDE].eq("CASH") | merged[COL_TICKER].eq("CASH")
+    cash_mask = (
+        merged[COL_POSITION_SIDE].astype(str).str.upper().eq("CASH")
+        | merged[COL_TICKER].astype(str).str.upper().isin(CASH_LIKE_TICKERS)
+        | merged[COL_TEAM].astype(str).str.upper().eq("CASH")
+    )
     merged.loc[cash_mask, COL_PRICE] = 1.0
 
     merged[COL_MARKET_VALUE] = pd.NA
