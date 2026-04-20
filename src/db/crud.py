@@ -842,6 +842,25 @@ def load_upload_logs(
     ])
 
 
+def clear_all_uploaded_portfolio_data(session: Session) -> dict[str, int]:
+    """
+    Delete all data created by snapshot/trade upload workflows.
+
+    This intentionally clears only upload-backed portfolio state tables and
+    leaves market price history untouched.
+    """
+    counts = {
+        "portfolio_snapshots": int(session.execute(delete(PortfolioSnapshot)).rowcount or 0),
+        "trade_receipts": int(session.execute(delete(TradeReceipt)).rowcount or 0),
+        "cash_ledger": int(session.execute(delete(CashLedger)).rowcount or 0),
+        "reconciliation_events": int(session.execute(delete(ReconciliationEvent)).rowcount or 0),
+        "position_state": int(session.execute(delete(PositionState)).rowcount or 0),
+        "upload_logs": int(session.execute(delete(UploadLog)).rowcount or 0),
+    }
+    session.flush()
+    return counts
+
+
 # ============================================================================
 # Portfolio activity feed
 # ============================================================================

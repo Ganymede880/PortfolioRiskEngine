@@ -27,14 +27,31 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from src.db.crud import load_portfolio_activity
+from src.db import crud
 from src.db.session import session_scope
 from src.config.settings import settings
 from src.utils.ui import apply_app_theme, left_align_dataframe
 
 
 def _apply_portfolio_activity_filter_theme() -> None:
-    return None
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stButton"] > button[kind="primary"] {
+            background: #B91C1C;
+            border: 1px solid #991B1B;
+            color: #FFFFFF;
+        }
+
+        div[data-testid="stButton"] > button[kind="primary"]:hover {
+            background: #991B1B;
+            border-color: #7F1D1D;
+            color: #FFFFFF;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _format_currency(value):
@@ -195,15 +212,53 @@ def _render_filters(activity_df: pd.DataFrame) -> tuple[str, list[str], str]:
     return selected_team, selected_activity_types, ticker_search
 
 
+def _render_clear_uploads_action() -> None:
+    with st.container(border=True):
+        action_col, confirm_col = st.columns([1, 1.4])
+        with action_col:
+            if st.button(
+                "Clear All Uploads",
+                type="primary",
+                use_container_width=True,
+            ):
+                if not st.session_state.get("confirm_clear_all_uploads", False):
+                    st.warning("Check the confirmation box before clearing all uploaded portfolio data.")
+                else:
+                    with session_scope() as session:
+                        counts = crud.clear_all_uploaded_portfolio_data(session)
+                    st.session_state["confirm_clear_all_uploads"] = False
+                    st.session_state["last_clear_all_uploads_counts"] = counts
+                    st.rerun()
+        with confirm_col:
+            st.checkbox(
+                "I understand this will delete all uploaded files.",
+                key="confirm_clear_all_uploads",
+            )
+
+    if "last_clear_all_uploads_counts" in st.session_state:
+        counts = st.session_state.pop("last_clear_all_uploads_counts")
+        st.success(
+            "Cleared uploaded portfolio data: "
+            f"{counts.get('portfolio_snapshots', 0)} snapshot rows, "
+            f"{counts.get('trade_receipts', 0)} trade rows, "
+            f"{counts.get('cash_ledger', 0)} cash ledger rows, "
+            f"{counts.get('reconciliation_events', 0)} reconciliation rows, "
+            f"{counts.get('position_state', 0)} position-state rows, and "
+            f"{counts.get('upload_logs', 0)} upload log rows."
+        )
+
+
 def main() -> None:
     st.set_page_config(page_title="Portfolio Activity", layout="wide")
     apply_app_theme()
     _apply_portfolio_activity_filter_theme()
     init_db()
     st.title("Portfolio Activity")
+    _render_clear_uploads_action()
+    st.divider()
 
     with session_scope() as session:
-        activity_df = load_portfolio_activity(session=session)
+        activity_df = crud.load_portfolio_activity(session=session)
 
     if activity_df.empty:
         st.info("No portfolio activity is available yet. Upload snapshots or trade receipts to populate this page.")
