@@ -314,6 +314,34 @@ def _derive_net_cash_amount(
     return pd.to_numeric(result, errors="coerce")
 
 
+def _normalize_explicit_net_cash_amount(
+    trade_side: pd.Series,
+    net_cash_amount: pd.Series,
+) -> pd.Series:
+    """
+    Normalize explicit net-cash values to the app's signed convention.
+
+    Some broker exports provide net consideration as an absolute value for both
+    buys and sells. Internally we require:
+    - BUY / COVER -> negative cash
+    - SELL / SHORT_SELL -> positive cash
+    """
+    cash_amount = pd.to_numeric(net_cash_amount, errors="coerce")
+    magnitude = cash_amount.abs()
+
+    result = pd.Series(pd.NA, index=trade_side.index, dtype="object")
+    buy_like = trade_side.isin(["BUY", "COVER"])
+    sell_like = trade_side.isin(["SELL", "SHORT_SELL"])
+
+    result.loc[buy_like] = -magnitude.loc[buy_like]
+    result.loc[sell_like] = magnitude.loc[sell_like]
+
+    unresolved_mask = ~(buy_like | sell_like)
+    result.loc[unresolved_mask] = cash_amount.loc[unresolved_mask]
+
+    return pd.to_numeric(result, errors="coerce")
+
+
 def normalize_trade_receipt_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Normalize a raw trade receipt DataFrame into canonical trade schema.
@@ -396,7 +424,10 @@ def normalize_trade_receipt_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
         normalized_df["fees"] = 0.0
 
     if "net_cash_amount" in resolved_columns:
-        normalized_df["net_cash_amount"] = _coerce_numeric(working_df[resolved_columns["net_cash_amount"]])
+        normalized_df["net_cash_amount"] = _normalize_explicit_net_cash_amount(
+            trade_side=normalized_df["trade_side"],
+            net_cash_amount=working_df[resolved_columns["net_cash_amount"]],
+        )
     else:
         normalized_df["net_cash_amount"] = _derive_net_cash_amount(
             trade_side=normalized_df["trade_side"],
