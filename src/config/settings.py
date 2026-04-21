@@ -89,6 +89,7 @@ class Settings:
         "Financials": "F&R",
         "Healthcare": "Healthcare",
         "TMT": "TMT",
+        "Technology & Telecommunication Services": "TMT",
         "Industrials": "M&I",
         "Materials": "M&I",
         "Cash": "Cash",

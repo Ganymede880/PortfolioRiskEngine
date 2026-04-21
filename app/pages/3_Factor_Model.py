@@ -12,6 +12,7 @@ import html
 from pathlib import Path
 import sys
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -28,7 +29,7 @@ from src.config.settings import settings
 from src.data.price_fetcher import fetch_latest_prices
 from src.db.crud import load_position_state
 from src.db.session import session_scope
-from src.utils.constants import FACTOR_COLORS
+from src.utils.constants import FACTOR_COLORS, TEAM_COLORS
 from src.utils.ui import apply_app_theme, left_align_dataframe, style_plotly_figure, render_top_nav
 
 COL_TICKER = "ticker"
@@ -36,15 +37,6 @@ COL_MARKET_VALUE = "market_value"
 COL_WEIGHT = "weight"
 COL_TEAM = "team"
 COL_POSITION_SIDE = "position_side"
-TEAM_COLORS = {
-    "Consumer": "#C6D4FF",
-    "E&U": "#7A82AB",
-    "F&R": "#307473",
-    "Healthcare": "#12664F",
-    "TMT": "#2DC2BD",
-    "M&I": "#3F3047",
-    "Cash": "#7A82AB",
-}
 def _format_currency(value):
     if value is None or pd.isna(value):
         return "N/A"
@@ -266,6 +258,11 @@ def render_portfolio_factor_beta_snapshot(latest_df: pd.DataFrame, summary_df: p
         return
 
     latest = latest_df.iloc[0]
+    alpha_daily = pd.to_numeric(pd.Series([latest.get("alpha")]), errors="coerce").iloc[0]
+    alpha_annualized = np.nan
+    if pd.notna(alpha_daily):
+        alpha_annualized = float((1.0 + float(alpha_daily)) ** settings.trading_days_per_year - 1.0)
+
     with st.container(border=True):
         row_1 = st.columns(4)
         with row_1[0]:
@@ -281,7 +278,7 @@ def render_portfolio_factor_beta_snapshot(latest_df: pd.DataFrame, summary_df: p
 
         row_2 = st.columns(4)
         with row_2[0]:
-            _render_factor_beta_card("Portfolio Alpha", _format_number(latest.get("alpha")))
+            _render_factor_beta_card("Annualized Alpha", _format_percent(alpha_annualized))
         with row_2[1]:
             _render_factor_beta_card("R-Squared", _format_number(latest.get("r_squared")))
         with row_2[2]:

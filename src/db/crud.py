@@ -698,6 +698,22 @@ def get_latest_position_state_date(session: Session) -> Optional[date]:
     return session.execute(stmt).scalar_one_or_none()
 
 
+def get_latest_position_state_before_or_on(
+    session: Session,
+    as_of_date: date,
+) -> Optional[date]:
+    """
+    Return the latest position_state as_of_date on or before the supplied date.
+    """
+    stmt = (
+        select(PositionState.as_of_date)
+        .where(PositionState.as_of_date <= as_of_date)
+        .order_by(PositionState.as_of_date.desc())
+        .limit(1)
+    )
+    return session.execute(stmt).scalar_one_or_none()
+
+
 # ============================================================================
 # Price history
 # ============================================================================
@@ -935,6 +951,9 @@ def load_portfolio_activity(
         team=team,
     )
     if not cash_df.empty:
+        cash_df = cash_df.loc[
+            cash_df["activity_type"].astype(str).str.upper().ne("RECONCILIATION")
+        ].copy()
         for _, row in cash_df.iterrows():
             activities.append({
                 "activity_date": row["activity_date"],

@@ -93,22 +93,56 @@ def apply_holdings_page_theme() -> None:
     st.markdown(
         """
         <style>
-        div[data-testid="stSlider"] {
-            max-width: 320px;
+        div[data-testid="stButton"] > button {
+            border-radius: 12px;
+            border: 1px solid rgba(29, 78, 216, 0.38);
+            background: rgba(20, 52, 110, 0.16);
+            color: #93C5FD;
+            font-weight: 600;
+            min-height: 3rem;
+            height: 3rem;
+            padding: 0;
+        }
+
+        div[data-testid="stButton"] > button:hover {
+            border-color: rgba(191, 219, 254, 0.88);
+            color: #DBEAFE;
+        }
+
+        .holdings-threshold-shell {
+            max-width: 440px;
             margin: 0 auto;
         }
 
-        div[data-testid="stSlider"] [data-baseweb="slider"] > div > div:nth-child(1) {
-            background: rgba(51, 65, 85, 0.5) !important;
+        .holdings-threshold-title {
+            text-align: center;
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #E2E8F0;
+            margin-bottom: 0.55rem;
         }
 
-        div[data-testid="stSlider"] [data-baseweb="slider"] > div > div:nth-child(2) {
-            background: linear-gradient(135deg, rgba(20, 52, 110, 0.96), rgba(29, 78, 216, 0.92)) !important;
+        .holdings-threshold-value {
+            text-align: center;
+            border-radius: 16px;
+            border: 1px solid rgba(59, 130, 246, 0.36);
+            background: linear-gradient(135deg, rgba(20, 52, 110, 0.96), rgba(29, 78, 216, 0.92));
+            color: #FFFFFF;
+            font-size: 1.15rem;
+            font-weight: 700;
+            min-height: 3rem;
+            padding: 0 0.85rem;
+            margin: 0 auto;
+            min-width: 6.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
 
-        div[data-testid="stSlider"] [role="slider"] {
-            background: #1D4ED8 !important;
-            border: 2px solid rgba(191, 219, 254, 0.88) !important;
+        .holdings-threshold-preset-active {
+            background: linear-gradient(135deg, rgba(20, 52, 110, 0.96), rgba(29, 78, 216, 0.92));
+            border-color: rgba(191, 219, 254, 0.88);
+            color: #FFFFFF;
         }
         </style>
         """,
@@ -476,18 +510,55 @@ def render_filters(snapshot_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def render_constellation_threshold_control() -> float:
-    left_col, center_col, right_col = st.columns([0.32, 0.36, 0.32])
-    with center_col:
-        return float(
-            st.slider(
-                "Correlation Threshold",
-                min_value=0.20,
-                max_value=0.90,
-                value=0.50,
-                step=0.05,
-                key="holdings_corr_threshold",
-            )
+    options = [round(value, 2) for value in [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]]
+    session_key = "holdings_corr_threshold"
+    default_value = 0.50
+
+    if session_key not in st.session_state or round(float(st.session_state[session_key]), 2) not in options:
+        st.session_state[session_key] = default_value
+
+    def _step_threshold(step: int) -> None:
+        live_value = round(float(st.session_state.get(session_key, default_value)), 2)
+        if live_value not in options:
+            live_value = default_value
+        live_index = options.index(live_value)
+        next_index = min(max(live_index + step, 0), len(options) - 1)
+        st.session_state[session_key] = options[next_index]
+
+    current_value = round(float(st.session_state[session_key]), 2)
+    at_minimum = current_value <= options[0]
+    at_maximum = current_value >= options[-1]
+
+    st.markdown('<div class="holdings-threshold-shell">', unsafe_allow_html=True)
+    st.markdown('<div class="holdings-threshold-title">Correlation Threshold</div>', unsafe_allow_html=True)
+
+    minus_col, value_col, plus_col = st.columns([0.7, 1.6, 0.7])
+    with minus_col:
+        st.button(
+            "-",
+            key="holdings_corr_threshold_down",
+            use_container_width=True,
+            on_click=_step_threshold,
+            args=(-1,),
+            disabled=at_minimum,
         )
+    with value_col:
+        st.markdown(
+            f'<div class="holdings-threshold-value">{current_value:.2f}</div>',
+            unsafe_allow_html=True,
+        )
+    with plus_col:
+        st.button(
+            "+",
+            key="holdings_corr_threshold_up",
+            use_container_width=True,
+            on_click=_step_threshold,
+            args=(1,),
+            disabled=at_maximum,
+        )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    return float(st.session_state[session_key])
 
 
 def render_holdings_constellation(graph_payload: dict[str, object] | None) -> None:

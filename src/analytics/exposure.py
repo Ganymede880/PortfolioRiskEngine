@@ -47,6 +47,7 @@ COL_POSITION_SIDE = "position_side"
 COL_SHARES = "shares"
 FACTOR_COLUMNS = ["MKT", "SMB", "MOM", "VAL"]
 EXTERNAL_FLOW_ACTIVITY_TYPES = {"SECTOR_REBALANCE", "PORTFOLIO_LIQUIDATION"}
+VALID_POSITION_SIDES = {"LONG", "SHORT", "CASH"}
 YAHOO_TICKER_REPLACEMENTS = {
     "BRK.B": "BRK-B",
     "BF.B": "BF-B",
@@ -509,6 +510,88 @@ def _build_price_matrix(price_history_df: pd.DataFrame) -> pd.DataFrame:
     return working.pivot_table(index="date", columns="ticker", values="px", aggfunc="last").sort_index().ffill()
 
 
+def _compute_position_value(positions_df: pd.DataFrame, price_map: dict[str, float]) -> float:
+    if positions_df.empty:
+        return 0.0
+
+    total = 0.0
+    for _, row in positions_df.iterrows():
+        ticker = str(row.get(COL_TICKER, "")).strip().upper()
+        side = str(row.get(COL_POSITION_SIDE, "")).strip().upper()
+        team = str(row.get(COL_TEAM, "")).strip().upper()
+        shares = float(pd.to_numeric(pd.Series([row.get(COL_SHARES)]), errors="coerce").fillna(0.0).iloc[0])
+        if ticker in {"CASH", "EUR", "GBP", "NOGXX"} or side == "CASH" or team == "CASH":
+            total += shares
+        else:
+            px = price_map.get(ticker, 0.0)
+            total += (-shares * px) if side == "SHORT" else (shares * px)
+    return float(total)
+
+
+def _transition_positions_for_day(
+    active_positions_df: pd.DataFrame | None,
+    snapshot_for_day: pd.DataFrame | None,
+    trades_today: pd.DataFrame | None,
+    cash_today: pd.DataFrame | None,
+    price_map: dict[str, float],
+) -> tuple[pd.DataFrame | None, float, float]:
+    net_external_flow = 0.0
+    reconciliation_pnl = 0.0
+
+    expected_positions_df = active_positions_df.copy() if active_positions_df is not None else None
+    if expected_positions_df is not None and trades_today is not None and not trades_today.empty:
+        expected_positions_df, _ = apply_trades_to_positions(expected_positions_df, trades_today)
+
+    if cash_today is not None and not cash_today.empty:
+        net_external_flow = float(pd.to_numeric(cash_today["amount"], errors="coerce").fillna(0.0).sum())
+        if expected_positions_df is not None:
+            expected_positions_df = apply_cash_ledger_entries_to_positions(expected_positions_df, cash_today)
+
+    if snapshot_for_day is not None:
+        if expected_positions_df is not None:
+            reconciliation_pnl = float(
+                _compute_position_value(snapshot_for_day, price_map)
+                - _compute_position_value(expected_positions_df, price_map)
+            )
+        return snapshot_for_day.copy(), net_external_flow, reconciliation_pnl
+
+    return expected_positions_df, net_external_flow, reconciliation_pnl
+
+
+def _validate_snapshot_history_integrity(snapshots_df: pd.DataFrame) -> None:
+    """
+    Fail fast when stored snapshots contain invalid position-side values.
+    """
+    if snapshots_df.empty or COL_POSITION_SIDE not in snapshots_df.columns:
+        return
+
+    sides = snapshots_df[COL_POSITION_SIDE].astype(str).str.strip().str.upper()
+    invalid_mask = ~sides.isin(VALID_POSITION_SIDES)
+    if not invalid_mask.any():
+        return
+
+    invalid_rows = snapshots_df.loc[invalid_mask].copy()
+    preview_cols = [
+        col
+        for col in ["snapshot_date", "team", "ticker", "position_side", "source_file"]
+        if col in invalid_rows.columns
+    ]
+    preview_records = invalid_rows[preview_cols].head(5).to_dict("records")
+    affected_dates = sorted(
+        pd.to_datetime(invalid_rows["snapshot_date"], errors="coerce")
+        .dropna()
+        .dt.strftime("%Y-%m-%d")
+        .unique()
+        .tolist()
+    )
+    raise ValueError(
+        "Portfolio snapshots contain invalid position_side values, so holdings history cannot be reconstructed. "
+        f"Affected snapshot dates: {affected_dates[:5]}. "
+        f"Example rows: {preview_records}. "
+        "This usually means a snapshot upload mapped the Position column incorrectly."
+    )
+
+
 def _compute_daily_stock_beta(stock_returns: pd.DataFrame, market_returns: pd.Series, lookback: int = 252) -> pd.DataFrame:
     if stock_returns.empty or market_returns.empty:
         return pd.DataFrame(index=stock_returns.index, columns=stock_returns.columns, dtype="float64")
@@ -752,7 +835,7 @@ def build_portfolio_return_history(lookback_days: int = 450) -> pd.DataFrame:
         cash_df = load_cash_ledger(session)
 
     if snapshots_df.empty:
-        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "portfolio_return", "portfolio_pnl"])
+        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "reconciliation_pnl", "portfolio_return", "portfolio_pnl"])
 
     snapshots = snapshots_df.copy()
     snapshots["snapshot_date"] = pd.to_datetime(snapshots["snapshot_date"], errors="coerce")
@@ -760,16 +843,17 @@ def build_portfolio_return_history(lookback_days: int = 450) -> pd.DataFrame:
     snapshots[COL_TEAM] = snapshots[COL_TEAM].astype(str).str.strip()
     snapshots[COL_POSITION_SIDE] = snapshots[COL_POSITION_SIDE].astype(str).str.strip().str.upper()
     snapshots[COL_SHARES] = pd.to_numeric(snapshots[COL_SHARES], errors="coerce")
+    _validate_snapshot_history_integrity(snapshots)
     snapshots = snapshots.dropna(subset=["snapshot_date", COL_TICKER, COL_SHARES]).copy()
     if snapshots.empty:
-        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "portfolio_return", "portfolio_pnl"])
+        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "reconciliation_pnl", "portfolio_return", "portfolio_pnl"])
 
     today = pd.Timestamp.today().normalize()
     oldest_snapshot_date = snapshots["snapshot_date"].min().normalize()
     start_date = max(oldest_snapshot_date, today - pd.Timedelta(days=lookback_days))
     business_dates = pd.bdate_range(start=start_date, end=today)
     if len(business_dates) == 0:
-        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "portfolio_return", "portfolio_pnl"])
+        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "reconciliation_pnl", "portfolio_return", "portfolio_pnl"])
 
     trades = trades_df.copy()
     if not trades.empty:
@@ -783,6 +867,13 @@ def build_portfolio_return_history(lookback_days: int = 450) -> pd.DataFrame:
         external_cash["activity_type"] = external_cash["activity_type"].astype(str).str.strip().str.upper()
         external_cash["amount"] = pd.to_numeric(external_cash["amount"], errors="coerce").fillna(0.0)
         external_cash = external_cash.loc[external_cash["activity_type"].isin(EXTERNAL_FLOW_ACTIVITY_TYPES)].dropna(subset=["activity_date"]).copy()
+        if not external_cash.empty:
+            cash_dates = external_cash["activity_date"].dt.normalize()
+            aligned_idx = business_dates.searchsorted(cash_dates)
+            valid_mask = aligned_idx < len(business_dates)
+            external_cash = external_cash.loc[valid_mask].copy()
+            if not external_cash.empty:
+                external_cash["flow_date"] = business_dates.take(aligned_idx[valid_mask]).normalize()
 
     price_tickers = sorted(
         {
@@ -796,61 +887,63 @@ def build_portfolio_return_history(lookback_days: int = 450) -> pd.DataFrame:
 
     snapshots_by_date = {dt.normalize(): grp.copy() for dt, grp in snapshots.groupby(snapshots["snapshot_date"].dt.normalize())}
     trades_by_date = {dt.normalize(): grp.copy() for dt, grp in trades.groupby(trades["trade_date"].dt.normalize())} if not trades.empty else {}
-    cash_by_date = {dt.normalize(): grp.copy() for dt, grp in external_cash.groupby(external_cash["activity_date"].dt.normalize())} if not external_cash.empty else {}
+    cash_by_date = {dt.normalize(): grp.copy() for dt, grp in external_cash.groupby("flow_date")} if not external_cash.empty else {}
 
     active_positions_df: pd.DataFrame | None = None
     rows: list[dict[str, Any]] = []
 
     for dt in business_dates:
-        snapshot_for_day = snapshots_by_date.get(dt.normalize())
-        if snapshot_for_day is not None:
-            active_positions_df = snapshot_for_day.copy()
-        else:
-            if active_positions_df is None:
-                eligible = [d for d in snapshots_by_date.keys() if d <= dt]
-                if not eligible:
-                    continue
-                active_positions_df = snapshots_by_date[max(eligible)].copy()
-            trades_today = trades_by_date.get(dt.normalize())
-            if trades_today is not None and not trades_today.empty:
-                active_positions_df, _ = apply_trades_to_positions(active_positions_df, trades_today)
-
-        net_external_flow = 0.0
-        cash_today = cash_by_date.get(dt.normalize())
-        if cash_today is not None and not cash_today.empty:
-            net_external_flow = float(pd.to_numeric(cash_today["amount"], errors="coerce").fillna(0.0).sum())
-            if snapshot_for_day is None and active_positions_df is not None:
-                active_positions_df = apply_cash_ledger_entries_to_positions(active_positions_df, cash_today)
-
-        if active_positions_df is None:
-            continue
-
         price_map = {}
         if dt in price_matrix.index:
             row = price_matrix.loc[dt]
             price_map = {str(col).strip().upper(): float(row[col]) for col in price_matrix.columns if pd.notna(row[col])}
 
-        portfolio_aum = 0.0
-        for _, row in active_positions_df.iterrows():
-            ticker = str(row.get(COL_TICKER, "")).strip().upper()
-            side = str(row.get(COL_POSITION_SIDE, "")).strip().upper()
-            team = str(row.get(COL_TEAM, "")).strip().upper()
-            shares = float(pd.to_numeric(pd.Series([row.get(COL_SHARES)]), errors="coerce").fillna(0.0).iloc[0])
-            if ticker in {"CASH", "EUR", "GBP", "NOGXX"} or side == "CASH" or team == "CASH":
-                portfolio_aum += shares
-            else:
-                px = price_map.get(ticker, 0.0)
-                portfolio_aum += (-shares * px) if side == "SHORT" else (shares * px)
+        snapshot_for_day = snapshots_by_date.get(dt.normalize())
+        if active_positions_df is None:
+            eligible = [d for d in snapshots_by_date.keys() if d <= dt]
+            if not eligible:
+                continue
+            if snapshot_for_day is None:
+                active_positions_df = snapshots_by_date[max(eligible)].copy()
 
-        rows.append({"date": dt, "portfolio_aum": float(portfolio_aum), "net_external_flow": net_external_flow})
+        active_positions_df, net_external_flow, reconciliation_pnl = _transition_positions_for_day(
+            active_positions_df=active_positions_df,
+            snapshot_for_day=snapshot_for_day,
+            trades_today=trades_by_date.get(dt.normalize()),
+            cash_today=cash_by_date.get(dt.normalize()),
+            price_map=price_map,
+        )
+        if active_positions_df is None:
+            continue
+
+        portfolio_aum = _compute_position_value(active_positions_df, price_map)
+        rows.append(
+            {
+                "date": dt,
+                "portfolio_aum": float(portfolio_aum),
+                "net_external_flow": net_external_flow,
+                "reconciliation_pnl": reconciliation_pnl,
+            }
+        )
 
     history_df = pd.DataFrame(rows)
     if history_df.empty:
-        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "portfolio_return", "portfolio_pnl"])
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "portfolio_aum",
+                "net_external_flow",
+                "reconciliation_pnl",
+                "portfolio_return",
+                "portfolio_pnl",
+            ]
+        )
 
     prepared = prepare_flow_adjusted_history(history_df, value_column="portfolio_aum", flow_column="net_external_flow")
     prepared = prepared.rename(columns={"performance_return": "portfolio_return", "performance_pnl": "portfolio_pnl"})
-    return prepared[["date", "portfolio_aum", "net_external_flow", "portfolio_return", "portfolio_pnl"]]
+    if "reconciliation_pnl" not in prepared.columns:
+        prepared["reconciliation_pnl"] = 0.0
+    return prepared[["date", "portfolio_aum", "net_external_flow", "reconciliation_pnl", "portfolio_return", "portfolio_pnl"]]
 
 
 def _build_regression_suite(

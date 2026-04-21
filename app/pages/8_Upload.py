@@ -9,7 +9,7 @@ Snapshot logic:
 - first snapshot seeds position_state
 - later snapshots compare against latest expected position_state
 - differences generate reconciliation events
-- reconciliation cash offsets are written to cash_ledger
+- reconciliation differences are valued as reconciliation gain/loss
 - latest authoritative snapshot replaces position_state
 
 Trade logic:
@@ -39,7 +39,7 @@ from src.data.normalizers import (
 )
 from src.data.validators import validate_uploaded_dataframe
 from src.db.crud import (
-    get_latest_position_state_date,
+    get_latest_position_state_before_or_on,
     load_cash_ledger,
     load_position_state,
     load_trade_receipts,
@@ -52,6 +52,7 @@ from src.db.crud import (
 )
 from src.db.models import CashLedger, ReconciliationEvent
 from src.db.session import session_scope
+from src.data.price_fetcher import fetch_multiple_price_histories
 from src.analytics.ledger import (
     ReconciliationConfig,
     apply_cash_ledger_entries_to_positions,
@@ -61,6 +62,8 @@ from src.analytics.ledger import (
 )
 from src.db import crud
 from src.utils.ui import apply_app_theme, left_align_dataframe, render_top_nav
+
+EXPLICIT_SNAPSHOT_FLOW_TYPES = {"SECTOR_REBALANCE", "PORTFOLIO_LIQUIDATION"}
 
 
 def _apply_upload_control_theme() -> None:
@@ -157,36 +160,81 @@ def _choose_snapshot_date(snapshot_df: pd.DataFrame) -> pd.Timestamp | None:
 
 def _choose_reconciliation_effective_date(snapshot_ts: pd.Timestamp) -> pd.Timestamp:
     """
-    MVP: use previous calendar day.
-    Later this should become previous trading day.
+    Recognize reconciliation on the snapshot date itself.
     """
-    effective_date = snapshot_ts - pd.Timedelta(days=1)
+    effective_date = snapshot_ts.normalize()
     st.info(f"Reconciliation effective date: {effective_date.date()}")
     return effective_date
 
 
-def _build_assumed_price_map_from_snapshot(snapshot_df: pd.DataFrame) -> dict:
+def _build_assumed_price_map(
+    snapshot_df: pd.DataFrame,
+    expected_positions_df: pd.DataFrame,
+    snapshot_ts: pd.Timestamp,
+) -> dict:
     """
-    Build an assumed price map from snapshot cost basis.
-
-    Later this should use actual market close prices.
+    Build an assumed price map from market prices on or before the snapshot date,
+    falling back to snapshot cost basis when market prices are unavailable.
     """
     price_map = {}
+
+    union_df = pd.concat([snapshot_df.copy(), expected_positions_df.copy()], ignore_index=True)
+    if not union_df.empty:
+        union_df["team"] = union_df.get("team", pd.Series("", index=union_df.index)).astype(str).str.strip()
+        union_df["ticker"] = union_df.get("ticker", pd.Series("", index=union_df.index)).astype(str).str.strip().str.upper()
+        union_df["position_side"] = union_df.get("position_side", pd.Series("", index=union_df.index)).astype(str).str.strip().str.upper()
+        market_tickers = sorted(
+            {
+                ticker
+                for ticker in union_df["ticker"].dropna().tolist()
+                if ticker and ticker not in {"CASH", "EUR", "GBP", "NOGXX"}
+            }
+        )
+        if market_tickers:
+            price_history_df = fetch_multiple_price_histories(
+                market_tickers,
+                lookback_days=max((pd.Timestamp.today().normalize() - snapshot_ts.normalize()).days + 30, 30),
+            )
+            if not price_history_df.empty:
+                prices = price_history_df.copy()
+                prices["date"] = pd.to_datetime(prices["date"], errors="coerce")
+                prices["ticker"] = prices["ticker"].astype(str).str.strip().str.upper()
+                prices["adj_close"] = pd.to_numeric(prices.get("adj_close"), errors="coerce")
+                prices["close"] = pd.to_numeric(prices.get("close"), errors="coerce")
+                prices["px"] = prices["adj_close"]
+                missing_mask = prices["px"].isna()
+                prices.loc[missing_mask, "px"] = prices.loc[missing_mask, "close"]
+                prices = prices.dropna(subset=["date", "ticker", "px"]).copy()
+                prices = prices.loc[prices["date"].dt.normalize() <= snapshot_ts.normalize()].copy()
+                if not prices.empty:
+                    latest_prices = (
+                        prices.sort_values(["ticker", "date"])
+                        .groupby("ticker", as_index=False)
+                        .tail(1)
+                        .set_index("ticker")["px"]
+                        .to_dict()
+                    )
+                    for _, row in union_df.iterrows():
+                        team = str(row.get("team", "")).strip()
+                        ticker = str(row.get("ticker", "")).strip().upper()
+                        position_side = str(row.get("position_side", "")).strip().upper()
+                        if team and ticker and position_side and ticker in latest_prices:
+                            price_map[(team, ticker, position_side)] = float(latest_prices[ticker])
 
     if snapshot_df.empty or "cost_basis_per_share" not in snapshot_df.columns:
         return price_map
 
     for _, row in snapshot_df.iterrows():
         team = str(row.get("team", "")).strip()
-        ticker = str(row.get("ticker", "")).strip()
-        position_side = str(row.get("position_side", "")).strip()
+        ticker = str(row.get("ticker", "")).strip().upper()
+        position_side = str(row.get("position_side", "")).strip().upper()
         cost_basis = pd.to_numeric(
             pd.Series([row.get("cost_basis_per_share")]),
             errors="coerce",
         ).iloc[0]
 
         if team and ticker and position_side and pd.notna(cost_basis):
-            price_map[(team, ticker, position_side)] = float(cost_basis)
+            price_map.setdefault((team, ticker, position_side), float(cost_basis))
 
     return price_map
 
@@ -194,10 +242,11 @@ def _build_assumed_price_map_from_snapshot(snapshot_df: pd.DataFrame) -> dict:
 def _build_expected_positions_for_snapshot(
     session,
     snapshot_ts: pd.Timestamp,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    latest_state_date = get_latest_position_state_date(session)
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    prior_state_cutoff = (snapshot_ts.normalize() - pd.Timedelta(days=1)).date()
+    latest_state_date = get_latest_position_state_before_or_on(session, prior_state_cutoff)
     if latest_state_date is None:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     expected_positions_df = load_position_state(session, as_of_date=latest_state_date)
     between_trades_df = load_trade_receipts(
@@ -227,7 +276,98 @@ def _build_expected_positions_for_snapshot(
             cash_entries_df=non_reconciliation_cash_df,
         )
 
-    return carried_positions_df, between_trades_df
+    return carried_positions_df, between_trades_df, between_cash_df
+
+
+def _estimate_team_market_values(
+    positions_df: pd.DataFrame,
+    assumed_price_map: dict,
+) -> dict[str, float]:
+    if positions_df.empty:
+        return {}
+
+    working = positions_df.copy()
+    working["team"] = working.get("team", pd.Series("", index=working.index)).astype(str).str.strip()
+    working["ticker"] = working.get("ticker", pd.Series("", index=working.index)).astype(str).str.strip().str.upper()
+    working["position_side"] = working.get("position_side", pd.Series("", index=working.index)).astype(str).str.strip().str.upper()
+    working["shares"] = pd.to_numeric(working.get("shares"), errors="coerce").fillna(0.0)
+    working = working.loc[
+        ~working["ticker"].isin({"CASH", "EUR", "GBP", "CHF", "NOGXX"})
+    ].copy()
+    if working.empty:
+        return {}
+
+    values: dict[str, float] = {}
+    for _, row in working.iterrows():
+        key = (row["team"], row["ticker"], row["position_side"])
+        price = assumed_price_map.get(key)
+        if price is None or pd.isna(price):
+            continue
+
+        shares = float(row["shares"])
+        market_value = abs(shares * float(price))
+        values[row["team"]] = values.get(row["team"], 0.0) + market_value
+
+    return values
+
+
+def _build_sector_discontinuity_warnings(
+    expected_positions_df: pd.DataFrame,
+    snapshot_df: pd.DataFrame,
+    between_cash_df: pd.DataFrame,
+    assumed_price_map: dict,
+) -> list[str]:
+    expected_team_values = _estimate_team_market_values(expected_positions_df, assumed_price_map)
+    snapshot_team_values = _estimate_team_market_values(snapshot_df, assumed_price_map)
+    teams = sorted(set(expected_team_values) | set(snapshot_team_values))
+    if not teams:
+        return []
+
+    explicit_flow_teams: set[str] = set()
+    has_portfolio_liquidation = False
+    if not between_cash_df.empty:
+        explicit_cash = between_cash_df.copy()
+        explicit_cash["activity_type"] = explicit_cash["activity_type"].astype(str).str.strip().str.upper()
+        explicit_cash["team"] = explicit_cash["team"].astype(str).str.strip()
+        explicit_cash = explicit_cash.loc[
+            explicit_cash["activity_type"].isin(EXPLICIT_SNAPSHOT_FLOW_TYPES)
+        ].copy()
+        if not explicit_cash.empty:
+            explicit_flow_teams = {
+                team for team in explicit_cash["team"].dropna().tolist() if team
+            }
+            has_portfolio_liquidation = bool(
+                explicit_cash["activity_type"].eq("PORTFOLIO_LIQUIDATION").any()
+            )
+
+    warnings: list[str] = []
+    materiality_threshold = 1000.0
+    for team in teams:
+        expected_value = float(expected_team_values.get(team, 0.0))
+        snapshot_value = float(snapshot_team_values.get(team, 0.0))
+        team_has_explicit_flow = team in explicit_flow_teams
+
+        if (
+            expected_value > materiality_threshold
+            and snapshot_value <= materiality_threshold
+            and not team_has_explicit_flow
+            and not has_portfolio_liquidation
+        ):
+            warnings.append(
+                f"{team} disappears from the snapshot without an explicit sector rebalance or portfolio liquidation receipt. "
+                f"Expected carried value was about ${expected_value:,.0f}."
+            )
+        elif (
+            expected_value <= materiality_threshold
+            and snapshot_value > materiality_threshold
+            and not team_has_explicit_flow
+        ):
+            warnings.append(
+                f"{team} appears in the snapshot without an explicit sector rebalance receipt. "
+                f"Authoritative snapshot value is about ${snapshot_value:,.0f}."
+            )
+
+    return warnings
 
 
 def _build_external_flow_entries_for_trade_upload(
@@ -359,7 +499,7 @@ def _render_reconciliation_preview(
     )
 
     if not cash_df.empty:
-        st.markdown("**Derived Cash Offsets**")
+        st.markdown("**Derived Reconciliation Entries**")
         st.dataframe(
             left_align_dataframe(_format_df_preview(cash_df)),
             use_container_width=True,
@@ -421,9 +561,10 @@ def _save_snapshot_with_reconciliation(
         replace_existing=True,
     )
 
-    latest_state_date = get_latest_position_state_date(session)
+    prior_state_cutoff = (snapshot_ts.normalize() - pd.Timedelta(days=1)).date()
+    latest_state_date = get_latest_position_state_before_or_on(session, prior_state_cutoff)
 
-    # First snapshot: just seed
+    # First snapshot on or before this date: just seed
     if latest_state_date is None:
         position_state_seed_df = snapshot_df.copy()
         position_state_seed_df["as_of_date"] = snapshot_date
@@ -457,12 +598,22 @@ def _save_snapshot_with_reconciliation(
         }
 
     # Later snapshots: reconcile against expected state
-    expected_positions_df, between_trades_df = _build_expected_positions_for_snapshot(
+    expected_positions_df, between_trades_df, between_cash_df = _build_expected_positions_for_snapshot(
         session=session,
         snapshot_ts=snapshot_ts,
     )
     effective_ts = _choose_reconciliation_effective_date(snapshot_ts)
-    assumed_price_map = _build_assumed_price_map_from_snapshot(snapshot_df)
+    assumed_price_map = _build_assumed_price_map(
+        snapshot_df=snapshot_df,
+        expected_positions_df=expected_positions_df,
+        snapshot_ts=snapshot_ts,
+    )
+    sector_warnings = _build_sector_discontinuity_warnings(
+        expected_positions_df=expected_positions_df,
+        snapshot_df=snapshot_df,
+        between_cash_df=between_cash_df,
+        assumed_price_map=assumed_price_map,
+    )
 
     _, reconciliation_df, cash_df = reconcile_expected_positions_to_authoritative_snapshot(
         expected_positions_df=expected_positions_df,
@@ -483,10 +634,7 @@ def _save_snapshot_with_reconciliation(
         save_reconciliation_events(session, reconciliation_df)
         if not reconciliation_df.empty else 0
     )
-    cash_rows = (
-        save_cash_ledger_entries(session, cash_df)
-        if not cash_df.empty else 0
-    )
+    cash_rows = 0
 
     # Authoritative snapshot becomes latest position state
     position_state_seed_df = snapshot_df.copy()
@@ -527,10 +675,11 @@ def _save_snapshot_with_reconciliation(
         selected_sheet=selected_sheet,
         row_count=rows,
         status="success",
-        message=(
+            message=(
                 f"Saved snapshot for {snapshot_date} with {rows} rows. "
                 f"Applied {len(between_trades_df)} intervening trade row(s), "
-                f"generated {recon_rows} reconciliation rows, {cash_rows} cash rows, "
+                f"generated {recon_rows} reconciliation rows, "
+                f"flagged {len(sector_warnings)} sector discontinuity warning(s), "
                 f"and seeded {seeded_rows} position-state rows."
             ),
         )
@@ -543,7 +692,8 @@ def _save_snapshot_with_reconciliation(
         "trade_rows_applied": len(between_trades_df),
         "mode": "reconciled",
         "reconciliation_df": reconciliation_df,
-        "cash_df": cash_df,
+        "cash_df": pd.DataFrame(),
+        "sector_warnings": sector_warnings,
     }
 
 
@@ -648,15 +798,22 @@ def main() -> None:
                         st.warning("Please provide a snapshot date.")
                     else:
                         with session_scope() as session:
-                            latest_state_date = get_latest_position_state_date(session)
+                            latest_state_date = get_latest_position_state_before_or_on(
+                                session,
+                                (snapshot_ts.normalize() - pd.Timedelta(days=1)).date(),
+                            )
 
                             if latest_state_date is not None:
-                                expected_positions_df, between_trades_df = _build_expected_positions_for_snapshot(
+                                expected_positions_df, between_trades_df, between_cash_df = _build_expected_positions_for_snapshot(
                                     session=session,
                                     snapshot_ts=snapshot_ts,
                                 )
                                 effective_ts = _choose_reconciliation_effective_date(snapshot_ts)
-                                assumed_price_map = _build_assumed_price_map_from_snapshot(snapshot_df)
+                                assumed_price_map = _build_assumed_price_map(
+                                    snapshot_df=snapshot_df,
+                                    expected_positions_df=expected_positions_df,
+                                    snapshot_ts=snapshot_ts,
+                                )
 
                                 _, reconciliation_preview_df, cash_preview_df = reconcile_expected_positions_to_authoritative_snapshot(
                                     expected_positions_df=expected_positions_df,
@@ -671,6 +828,19 @@ def main() -> None:
                                     st.info(
                                         f"Carried forward {len(between_trades_df)} trade receipt row(s) into the expected portfolio before reconciliation."
                                     )
+
+                                sector_warnings = _build_sector_discontinuity_warnings(
+                                    expected_positions_df=expected_positions_df,
+                                    snapshot_df=snapshot_df,
+                                    between_cash_df=between_cash_df,
+                                    assumed_price_map=assumed_price_map,
+                                )
+                                if sector_warnings:
+                                    st.warning(
+                                        "Whole-sector discontinuities were detected without matching explicit rebalance/liquidation receipts."
+                                    )
+                                    for warning in sector_warnings:
+                                        st.write(f"- {warning}")
 
                                 _render_reconciliation_preview(
                                     reconciliation_preview_df,
@@ -701,9 +871,12 @@ def main() -> None:
                                     f"Saved {result['rows_saved']} snapshot rows for {snapshot_ts.date()}, "
                                     f"applied {result['trade_rows_applied']} trade row(s), "
                                     f"generated {result['reconciliation_rows']} reconciliation row(s), "
-                                    f"generated {result['cash_rows']} cash ledger row(s), "
                                     f"and seeded {result['position_state_rows']} position-state rows."
                                 )
+                                if result.get("sector_warnings"):
+                                    st.warning(
+                                        f"Flagged {len(result['sector_warnings'])} sector discontinuity warning(s) for this snapshot."
+                                    )
 
                 else:
                     norm = normalize_trade_receipt_and_tag_source(

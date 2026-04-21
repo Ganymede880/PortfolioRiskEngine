@@ -69,13 +69,14 @@ SUPPORTED_FACTORS: List[str] = [
 # Shared chart palettes
 # ---------------------------------------------------------------------
 TEAM_COLORS: Dict[str, str] = {
-    "Consumer": "#C6D4FF",
-    "E&U": "#7A82AB",
-    "F&R": "#307473",
-    "Healthcare": "#12664F",
-    "TMT": "#2DC2BD",
-    "M&I": "#3F3047",
-    "Cash": "#7A82AB",
+    "M&I": "#5C4A7A",
+    "E&U": "#2F6B45",
+    "TMT": "#2C7A7B",
+    "Healthcare": "#4A8FBF",
+    "Consumer": "#6A5AA6",
+    "F&R": "#2C5F9E",
+    "Cash": "#6B7C86",
+    "CASH": "#6B7C86",
 }
 
 FACTOR_COLORS: Dict[str, str] = {

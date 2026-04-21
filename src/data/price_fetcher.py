@@ -186,6 +186,50 @@ def _normalize_sector_key(key: str) -> str:
     )
 
 
+SP500_SECTOR_ALIASES: Dict[str, list[str]] = {
+    "materials": [
+        "basic materials",
+        "materials",
+    ],
+    "industrials": [
+        "industrials",
+    ],
+    "financials": [
+        "financial services",
+        "financials",
+    ],
+    "real_estate": [
+        "real estate",
+    ],
+    "consumer_cyclical": [
+        "consumer cyclical",
+        "consumer discretionary",
+    ],
+    "consumer_defensive": [
+        "consumer defensive",
+        "consumer staples",
+    ],
+    "utilities": [
+        "utilities",
+    ],
+    "energy": [
+        "energy",
+    ],
+    "healthcare": [
+        "healthcare",
+        "health care",
+    ],
+    "communication_services": [
+        "communication services",
+        "communications",
+    ],
+    "technology": [
+        "technology",
+        "information technology",
+    ],
+}
+
+
 def _coerce_sector_weightings(raw_sector_weightings) -> Dict[str, float]:
     """
     Normalize yfinance fund sector weightings to a simple dict of float weights.
@@ -228,6 +272,67 @@ def _coerce_sector_weightings(raw_sector_weightings) -> Dict[str, float]:
     return normalized
 
 
+def _sector_weight_from_aliases(
+    sector_weights: Dict[str, float],
+    sector_name: str,
+) -> float | None:
+    total = 0.0
+    found_any = False
+    for alias in SP500_SECTOR_ALIASES.get(sector_name, []):
+        alias_key = _normalize_sector_key(alias)
+        if alias_key in sector_weights:
+            total += float(sector_weights[alias_key])
+            found_any = True
+            break
+    return total if found_any else None
+
+
+def fetch_sp500_sector_proxy_weights() -> Dict[str, float | None]:
+    """
+    Fetch live SPY sector weights keyed by normalized sector bucket.
+
+    These are used as a practical market-cap proxy when constructing
+    composite pod benchmarks from sector ETFs.
+    """
+    default_result: Dict[str, float | None] = {
+        "materials": None,
+        "industrials": None,
+        "financials": None,
+        "real_estate": None,
+        "consumer_cyclical": None,
+        "consumer_defensive": None,
+        "utilities": None,
+        "energy": None,
+        "healthcare": None,
+        "communication_services": None,
+        "technology": None,
+    }
+    cache_path = _cache_path_for_named_payload("sp500_sector_proxy_weights", ".json")
+    cached = _read_json_cache(cache_path)
+    if _is_cache_fresh(cache_path, settings.price_refresh_interval_seconds):
+        return cached if isinstance(cached, dict) and cached else default_result
+
+    try:
+        with _yfinance_request_context():
+            raw_sector_weightings = yf.Ticker("SPY").funds_data.sector_weightings
+    except Exception:
+        return cached if isinstance(cached, dict) and cached else default_result
+
+    sector_weights = _coerce_sector_weightings(raw_sector_weightings)
+    if not sector_weights:
+        return cached if isinstance(cached, dict) and cached else default_result
+
+    result: Dict[str, float | None] = {
+        sector_name: _sector_weight_from_aliases(sector_weights, sector_name)
+        for sector_name in default_result
+    }
+
+    if any(value is not None for value in result.values()):
+        _write_json_cache(cache_path, result)
+
+    return result
+
+
 def fetch_sp500_sector_group_weights() -> Dict[str, float | None]:
     """
     Fetch live S&P 500 sector weights from SPY's reported sector exposure and
@@ -249,70 +354,14 @@ def fetch_sp500_sector_group_weights() -> Dict[str, float | None]:
     if _is_cache_fresh(cache_path, settings.price_refresh_interval_seconds):
         return cached if isinstance(cached, dict) and cached else default_result
 
-    try:
-        with _yfinance_request_context():
-            raw_sector_weightings = yf.Ticker("SPY").funds_data.sector_weightings
-    except Exception:
-        return cached if isinstance(cached, dict) and cached else default_result
-
-    sector_weights = _coerce_sector_weightings(raw_sector_weightings)
+    sector_weights = fetch_sp500_sector_proxy_weights()
     if not sector_weights:
         return cached if isinstance(cached, dict) and cached else default_result
 
-    aliases = {
-        "materials": [
-            "basic materials",
-            "materials",
-        ],
-        "industrials": [
-            "industrials",
-        ],
-        "financials": [
-            "financial services",
-            "financials",
-        ],
-        "real_estate": [
-            "real estate",
-        ],
-        "consumer_cyclical": [
-            "consumer cyclical",
-            "consumer discretionary",
-        ],
-        "consumer_defensive": [
-            "consumer defensive",
-            "consumer staples",
-        ],
-        "utilities": [
-            "utilities",
-        ],
-        "energy": [
-            "energy",
-        ],
-        "healthcare": [
-            "healthcare",
-            "health care",
-        ],
-        "communication_services": [
-            "communication services",
-            "communications",
-        ],
-        "technology": [
-            "technology",
-            "information technology",
-        ],
-    }
-
     def _sector_weight(*sector_names: str) -> float:
-        total = 0.0
-        found_any = False
-        for sector_name in sector_names:
-            for alias in aliases.get(sector_name, []):
-                alias_key = _normalize_sector_key(alias)
-                if alias_key in sector_weights:
-                    total += float(sector_weights[alias_key])
-                    found_any = True
-                    break
-        return total if found_any else float("nan")
+        values = [sector_weights.get(sector_name) for sector_name in sector_names]
+        values = [float(value) for value in values if value is not None and not pd.isna(value)]
+        return sum(values) if values else float("nan")
 
     result: Dict[str, float | None] = {
         "Consumer": _sector_weight("consumer_cyclical", "consumer_defensive"),

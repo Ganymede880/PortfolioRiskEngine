@@ -494,6 +494,82 @@ def compare_expected_positions_to_snapshot(
     return mismatches.reset_index(drop=True)
 
 
+def compute_reconciliation_market_value_impact(
+    expected_positions_df: pd.DataFrame,
+    snapshot_df: pd.DataFrame,
+    price_map: Dict[Tuple[str, str, str], float] | None = None,
+) -> tuple[pd.DataFrame, float]:
+    """
+    Value reconciliation differences at supplied market prices.
+
+    Returns:
+    - mismatch DataFrame with market_value_impact column
+    - total reconciliation market value impact
+    """
+    mismatches = compare_expected_positions_to_snapshot(expected_positions_df, snapshot_df)
+    if mismatches.empty:
+        return pd.DataFrame(columns=[
+            "team",
+            "ticker",
+            "position_side",
+            "expected_shares",
+            "snapshot_shares",
+            "delta_shares",
+            "price",
+            "market_value_impact",
+        ]), 0.0
+
+    working = mismatches.copy()
+    working = working.loc[
+        ~working.apply(
+            lambda row: _is_cash_like_position(
+                row["team"],
+                row["ticker"],
+                row["position_side"],
+            ),
+            axis=1,
+        )
+    ].reset_index(drop=True)
+    if working.empty:
+        return pd.DataFrame(columns=[
+            "team",
+            "ticker",
+            "position_side",
+            "expected_shares",
+            "snapshot_shares",
+            "delta_shares",
+            "price",
+            "market_value_impact",
+        ]), 0.0
+
+    prices = price_map or {}
+    impacts: List[float] = []
+    resolved_prices: List[float | None] = []
+
+    for _, row in working.iterrows():
+        key = (
+            str(row["team"]).strip(),
+            str(row["ticker"]).strip(),
+            str(row["position_side"]).strip(),
+        )
+        price = prices.get(key)
+        resolved_prices.append(price)
+
+        delta_shares = float(pd.to_numeric(pd.Series([row["delta_shares"]]), errors="coerce").fillna(0.0).iloc[0])
+        side = str(row["position_side"]).strip().upper()
+        if price is None or pd.isna(price):
+            impacts.append(0.0)
+        elif side == "SHORT":
+            impacts.append(float(-(delta_shares * float(price))))
+        else:
+            impacts.append(float(delta_shares * float(price)))
+
+    working["price"] = resolved_prices
+    working["market_value_impact"] = impacts
+    total_impact = float(pd.to_numeric(working["market_value_impact"], errors="coerce").fillna(0.0).sum())
+    return working, total_impact
+
+
 def generate_reconciliation_events(
     expected_positions_df: pd.DataFrame,
     snapshot_df: pd.DataFrame,
@@ -782,11 +858,16 @@ def reconcile_expected_positions_to_authoritative_snapshot(
         expected_positions_df=expected_positions_df,
         reconciliation_df=recon_df,
     )
-    cash_entries = generate_cash_reconciliation_entries(
-        expected_positions_df=expected_positions_df,
-        snapshot_df=authoritative_snapshot_df,
-        reconciliation_df=recon_df,
-        effective_date=effective_date,
+    cash_entries = pd.DataFrame(
+        columns=[
+            "activity_date",
+            "team",
+            "amount",
+            "activity_type",
+            "reference_type",
+            "reference_id",
+            "note",
+        ]
     )
 
     return updated_positions, recon_df, cash_entries

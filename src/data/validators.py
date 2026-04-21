@@ -14,6 +14,8 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
+from src.data.mappings import apply_team_mapping
+
 
 # ============================================================================
 # Column alias maps
@@ -59,6 +61,9 @@ TRADE_REQUIRED_COLUMNS = [
     "gross_price",
     "settlement_date",
 ]
+
+VALID_SNAPSHOT_POSITION_SIDES = {"LONG", "SHORT", "CASH"}
+VALID_TRADE_SIDES = {"BUY", "SELL", "SHORT_SELL", "COVER"}
 
 
 # ============================================================================
@@ -217,6 +222,61 @@ def _validate_duplicate_rows(
     return []
 
 
+def _validate_allowed_values(
+    df: pd.DataFrame,
+    actual_column_name: str | None,
+    field_label: str,
+    allowed_values: set[str],
+) -> List[str]:
+    """
+    Ensure a resolved string column only contains expected enumerated values.
+    """
+    if actual_column_name is None:
+        return []
+
+    series = df[actual_column_name].astype(str).str.strip().str.upper()
+    invalid_mask = (
+        series.ne("")
+        & series.ne("NAN")
+        & ~series.isin(allowed_values)
+    )
+    invalid_count = int(invalid_mask.sum())
+    if invalid_count == 0:
+        return []
+
+    invalid_examples = sorted(series.loc[invalid_mask].unique().tolist())[:5]
+    return [
+        f"{field_label} column contains {invalid_count} invalid value(s). "
+        f"Allowed values: {sorted(allowed_values)}. Examples: {invalid_examples}"
+    ]
+
+
+def _validate_team_mapping(
+    df: pd.DataFrame,
+    actual_column_name: str | None,
+    field_label: str,
+) -> List[str]:
+    """
+    Ensure uploaded team/sector labels map to canonical internal teams.
+    """
+    if actual_column_name is None:
+        return []
+
+    _, unmapped_teams = apply_team_mapping(
+        df.copy(),
+        source_column=actual_column_name,
+        output_column="team",
+    )
+    if not unmapped_teams:
+        return []
+
+    examples = sorted(unmapped_teams)[:5]
+    return [
+        f"{field_label} column contains {len(unmapped_teams)} unmapped value(s). "
+        f"Examples: {examples}. Add them to team mapping before uploading."
+    ]
+
+
 # ============================================================================
 # Snapshot validation
 # ============================================================================
@@ -237,8 +297,17 @@ def validate_snapshot_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
     errors.extend(required_errors)
 
     errors.extend(_validate_non_blank_values(df, resolved_columns.get("team"), "Team/Sector"))
+    errors.extend(_validate_team_mapping(df, resolved_columns.get("team"), "Team/Sector"))
     errors.extend(_validate_non_blank_values(df, resolved_columns.get("position_side"), "Position"))
     errors.extend(_validate_non_blank_values(df, resolved_columns.get("ticker"), "Ticker"))
+    errors.extend(
+        _validate_allowed_values(
+            df,
+            resolved_columns.get("position_side"),
+            "Position",
+            VALID_SNAPSHOT_POSITION_SIDES,
+        )
+    )
 
     errors.extend(_validate_numeric_values(df, resolved_columns.get("shares"), "Shares"))
     errors.extend(_validate_numeric_values(df, resolved_columns.get("cost_basis_per_share"), "Cost"))
@@ -291,6 +360,14 @@ def validate_trade_receipt_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
     errors.extend(_validate_non_blank_values(df, resolved_columns.get("team"), "Team/Sector"))
     errors.extend(_validate_non_blank_values(df, resolved_columns.get("trade_side"), "Trade Side"))
     errors.extend(_validate_non_blank_values(df, resolved_columns.get("ticker"), "Ticker"))
+    errors.extend(
+        _validate_allowed_values(
+            df,
+            resolved_columns.get("trade_side"),
+            "Trade Side",
+            VALID_TRADE_SIDES,
+        )
+    )
 
     errors.extend(_validate_numeric_values(df, resolved_columns.get("quantity"), "Quantity"))
     errors.extend(_validate_numeric_values(df, resolved_columns.get("gross_price"), "Gross Price"))

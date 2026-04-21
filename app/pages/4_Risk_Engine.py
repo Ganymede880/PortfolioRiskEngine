@@ -28,7 +28,7 @@ from src.config.settings import settings
 from src.data.price_fetcher import fetch_latest_prices, fetch_multiple_price_histories
 from src.db.crud import load_all_portfolio_snapshots, load_cash_ledger, load_position_state, load_trade_receipts
 from src.db.session import session_scope
-from src.utils.constants import FACTOR_COLORS
+from src.utils.constants import FACTOR_COLORS, TEAM_COLORS
 from src.utils.ui import apply_app_theme, left_align_dataframe, style_plotly_figure, render_top_nav
 
 
@@ -37,15 +37,6 @@ COL_TEAM = "team"
 COL_POSITION_SIDE = "position_side"
 COL_SHARES = "shares"
 TEAM_ORDER = ["Consumer", "E&U", "F&R", "Healthcare", "TMT", "M&I"]
-TEAM_COLORS = {
-    "Consumer": "#C6D4FF",
-    "E&U": "#7A82AB",
-    "F&R": "#307473",
-    "Healthcare": "#12664F",
-    "TMT": "#2DC2BD",
-    "M&I": "#3F3047",
-    "Cash": "#7A82AB",
-}
 EXTERNAL_FLOW_ACTIVITY_TYPES = {"SECTOR_REBALANCE", "PORTFOLIO_LIQUIDATION"}
 SCENARIO_LIBRARY = {
     "Custom": {
@@ -55,47 +46,68 @@ SCENARIO_LIBRARY = {
         "shock_mom": 0.00,
         "shock_val": 0.00,
     },
-    "Growth Selloff": {
-        "description": "Broad market down, momentum and growth leadership unwind, value outperforms.",
-        "shock_mkt": -0.06,
-        "shock_smb": -0.01,
-        "shock_mom": -0.05,
+    "Systematic De-Risking": {
+        "description": "Broad risk-off liquidation where beta, liquidity, and cyclicality all sell off together.",
+        "shock_mkt": -0.12,
+        "shock_smb": -0.08,
+        "shock_mom": -0.06,
         "shock_val": 0.03,
     },
-    "Value Reversal": {
-        "description": "Sharp reversal against value leadership with mild market weakness.",
-        "shock_mkt": -0.03,
-        "shock_smb": 0.00,
-        "shock_mom": 0.02,
-        "shock_val": -0.05,
+    "Growth Selloff": {
+        "description": "Long-duration growth equities reprice sharply lower as rates rise and valuation multiples compress.",
+        "shock_mkt": -0.06,
+        "shock_smb": -0.02,
+        "shock_mom": -0.08,
+        "shock_val": 0.10,
+    },
+    "Value Crash": {
+        "description": "Crowded value exposures unwind quickly while growth and momentum leadership reassert themselves.",
+        "shock_mkt": 0.04,
+        "shock_smb": 0.03,
+        "shock_mom": 0.06,
+        "shock_val": -0.12,
     },
     "Small Cap Stress": {
-        "description": "Risk-off tape with small caps underperforming and beta selling off.",
+        "description": "Financing pressure and falling risk appetite hit smaller and less liquid companies much harder than the broad market.",
         "shock_mkt": -0.05,
-        "shock_smb": -0.04,
-        "shock_mom": -0.01,
-        "shock_val": 0.01,
+        "shock_smb": -0.15,
+        "shock_mom": -0.02,
+        "shock_val": -0.03,
     },
     "Momentum Crash": {
-        "description": "Classic factor reversal where prior winners sharply mean revert.",
-        "shock_mkt": -0.02,
-        "shock_smb": 0.01,
-        "shock_mom": -0.08,
-        "shock_val": 0.04,
+        "description": "Recent winners reverse violently as crowded momentum positioning unwinds even without a full market selloff.",
+        "shock_mkt": 0.02,
+        "shock_smb": 0.04,
+        "shock_mom": -0.20,
+        "shock_val": 0.06,
     },
     "Inflation Shock": {
-        "description": "Macro shock with market drawdown, long-duration/growth under pressure, value relatively stronger.",
+        "description": "Higher inflation and rising yields pressure broad equities while value and real-asset-linked exposures outperform.",
         "shock_mkt": -0.07,
-        "shock_smb": -0.01,
-        "shock_mom": -0.03,
-        "shock_val": 0.02,
+        "shock_smb": -0.04,
+        "shock_mom": -0.05,
+        "shock_val": 0.08,
     },
     "Quality Rotation": {
-        "description": "Market declines and high-beta / crowded factor books are de-risked.",
-        "shock_mkt": -0.04,
-        "shock_smb": -0.02,
+        "description": "Investors rotate away from speculative leadership and toward cheaper, more stable, higher-quality businesses.",
+        "shock_mkt": 0.03,
+        "shock_smb": 0.02,
         "shock_mom": -0.03,
-        "shock_val": 0.00,
+        "shock_val": 0.05,
+    },
+    "Liquidity Crunch": {
+        "description": "Market depth vanishes and correlations spike, causing a sharp selloff across most risky factor exposures.",
+        "shock_mkt": -0.08,
+        "shock_smb": -0.12,
+        "shock_mom": -0.10,
+        "shock_val": -0.06,
+    },
+    "Factor Crowding Unwind": {
+        "description": "Crowded quant and relative-value exposures de-gross rapidly, hurting style factors even if the index is roughly flat.",
+        "shock_mkt": 0.00,
+        "shock_smb": -0.06,
+        "shock_mom": -0.12,
+        "shock_val": -0.08,
     },
 }
 
@@ -125,9 +137,35 @@ def _extract_latest_factor_loadings(rolling_betas_df: pd.DataFrame) -> dict[str,
     }
 
 
+def _compute_series_beta(
+    asset_returns: pd.Series,
+    benchmark_returns: pd.Series,
+    min_obs: int = 20,
+) -> float | None:
+    aligned = pd.concat(
+        [
+            pd.to_numeric(asset_returns, errors="coerce").rename("asset"),
+            pd.to_numeric(benchmark_returns, errors="coerce").rename("benchmark"),
+        ],
+        axis=1,
+    ).dropna()
+    if len(aligned) < min_obs:
+        return None
+
+    benchmark_var = float(aligned["benchmark"].var(ddof=1))
+    if not np.isfinite(benchmark_var) or abs(benchmark_var) <= 1e-12:
+        return None
+
+    covariance = float(aligned["asset"].cov(aligned["benchmark"]))
+    if not np.isfinite(covariance):
+        return None
+    return covariance / benchmark_var
+
+
 def _build_scenario_trade_recommendations(
     snapshot_df: pd.DataFrame,
     holdings_signals_df: pd.DataFrame,
+    pod_market_betas: dict[str, float] | None,
     shock_mkt: float,
     shock_smb: float,
     shock_mom: float,
@@ -153,11 +191,14 @@ def _build_scenario_trade_recommendations(
     working[COL_TEAM] = working[COL_TEAM].astype(str).str.strip()
     working[COL_POSITION_SIDE] = working[COL_POSITION_SIDE].astype(str).str.strip().str.upper()
 
-    # start with market exposure proxy = portfolio weight
+    beta_map = pod_market_betas or {}
     if "weight" in working.columns:
-        working["market_exposure_contribution"] = pd.to_numeric(working["weight"], errors="coerce").fillna(0.0)
+        working["weight"] = pd.to_numeric(working["weight"], errors="coerce").fillna(0.0)
     else:
-        working["market_exposure_contribution"] = 0.0
+        working["weight"] = 0.0
+    working["pod_beta_mkt"] = working[COL_TEAM].map(beta_map)
+    working["pod_beta_mkt"] = pd.to_numeric(working["pod_beta_mkt"], errors="coerce").fillna(1.0)
+    working["market_exposure_contribution"] = working["weight"] * working["pod_beta_mkt"]
 
     working["size_contribution"] = 0.0
     working["momentum_contribution"] = 0.0
@@ -455,6 +496,36 @@ def _compute_position_value(df: pd.DataFrame, price_map: dict[str, float]) -> fl
     return cash_total + float(pd.to_numeric(market_values, errors="coerce").fillna(0.0).sum())
 
 
+def _transition_positions_for_day(
+    active_positions_df: pd.DataFrame | None,
+    snapshot_for_day: pd.DataFrame | None,
+    trades_today: pd.DataFrame | None,
+    cash_today: pd.DataFrame | None,
+    price_map: dict[str, float],
+) -> tuple[pd.DataFrame | None, float, float]:
+    net_external_flow = 0.0
+    reconciliation_pnl = 0.0
+
+    expected_positions_df = active_positions_df.copy() if active_positions_df is not None else None
+    if expected_positions_df is not None and trades_today is not None and not trades_today.empty:
+        expected_positions_df, _ = apply_trades_to_positions(expected_positions_df, trades_today)
+
+    if cash_today is not None and not cash_today.empty:
+        net_external_flow = float(pd.to_numeric(cash_today["amount"], errors="coerce").fillna(0.0).sum())
+        if expected_positions_df is not None:
+            expected_positions_df = apply_cash_ledger_entries_to_positions(expected_positions_df, cash_today)
+
+    if snapshot_for_day is not None:
+        if expected_positions_df is not None:
+            reconciliation_pnl = float(
+                _compute_position_value(snapshot_for_day, price_map)
+                - _compute_position_value(expected_positions_df, price_map)
+            )
+        return snapshot_for_day.copy(), net_external_flow, reconciliation_pnl
+
+    return expected_positions_df, net_external_flow, reconciliation_pnl
+
+
 def _build_price_matrix(raw_price_history: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.DataFrame:
     if len(dates) == 0:
         return pd.DataFrame()
@@ -524,6 +595,13 @@ def _build_team_history(team: str, snapshots_df: pd.DataFrame) -> pd.DataFrame:
         external_cash = external_cash.loc[
             external_cash["activity_type"].isin(EXTERNAL_FLOW_ACTIVITY_TYPES)
         ].dropna(subset=["activity_date"]).copy()
+        if not external_cash.empty:
+            cash_dates = external_cash["activity_date"].dt.normalize()
+            aligned_idx = business_dates.searchsorted(cash_dates)
+            valid_mask = aligned_idx < len(business_dates)
+            external_cash = external_cash.loc[valid_mask].copy()
+            if not external_cash.empty:
+                external_cash["flow_date"] = business_dates.take(aligned_idx[valid_mask]).normalize()
 
     investable_tickers = df.loc[~_cash_like_mask(df), COL_TICKER].dropna().unique().tolist()
     trade_tickers = trades[COL_TICKER].dropna().unique().tolist() if not trades.empty else []
@@ -534,36 +612,12 @@ def _build_team_history(team: str, snapshots_df: pd.DataFrame) -> pd.DataFrame:
     snapshot_by_date = {dt.normalize(): grp.copy() for dt, grp in df.groupby("snapshot_date")}
     snapshot_dates = sorted(snapshot_by_date.keys())
     trades_by_date = {dt.normalize(): grp.copy() for dt, grp in trades.groupby(trades["trade_date"].dt.normalize())} if not trades.empty else {}
-    cash_by_date = {dt.normalize(): grp.copy() for dt, grp in external_cash.groupby(external_cash["activity_date"].dt.normalize())} if not external_cash.empty else {}
+    cash_by_date = {dt.normalize(): grp.copy() for dt, grp in external_cash.groupby("flow_date")} if not external_cash.empty else {}
 
     rows = []
     active_positions_df: pd.DataFrame | None = None
 
     for dt in business_dates:
-        net_external_flow = 0.0
-        snapshot_for_day = snapshot_by_date.get(dt.normalize())
-
-        if snapshot_for_day is not None:
-            active_positions_df = snapshot_for_day.copy()
-        else:
-            if active_positions_df is None:
-                eligible = [d for d in snapshot_dates if d <= dt]
-                if not eligible:
-                    continue
-                active_positions_df = snapshot_by_date[eligible[-1]].copy()
-            trades_today = trades_by_date.get(dt.normalize())
-            if trades_today is not None and not trades_today.empty:
-                active_positions_df, _ = apply_trades_to_positions(active_positions_df, trades_today)
-
-        cash_today = cash_by_date.get(dt.normalize())
-        if cash_today is not None and not cash_today.empty:
-            net_external_flow = float(pd.to_numeric(cash_today["amount"], errors="coerce").fillna(0.0).sum())
-            if snapshot_for_day is None and active_positions_df is not None:
-                active_positions_df = apply_cash_ledger_entries_to_positions(active_positions_df, cash_today)
-
-        if active_positions_df is None:
-            continue
-
         price_map = {}
         if dt in price_matrix.index:
             row = price_matrix.loc[dt]
@@ -573,9 +627,34 @@ def _build_team_history(team: str, snapshots_df: pd.DataFrame) -> pd.DataFrame:
                 if pd.notna(row[ticker])
             }
 
+        snapshot_for_day = snapshot_by_date.get(dt.normalize())
+        if active_positions_df is None:
+            eligible = [d for d in snapshot_dates if d <= dt]
+            if not eligible:
+                continue
+            if snapshot_for_day is None:
+                active_positions_df = snapshot_by_date[eligible[-1]].copy()
+
+        active_positions_df, net_external_flow, reconciliation_pnl = _transition_positions_for_day(
+            active_positions_df=active_positions_df,
+            snapshot_for_day=snapshot_for_day,
+            trades_today=trades_by_date.get(dt.normalize()),
+            cash_today=cash_by_date.get(dt.normalize()),
+            price_map=price_map,
+        )
+        if active_positions_df is None:
+            continue
+
         team_aum = _compute_position_value(active_positions_df, price_map)
 
-        rows.append({"date": dt, "team_aum": float(team_aum), "net_external_flow": net_external_flow})
+        rows.append(
+            {
+                "date": dt,
+                "team_aum": float(team_aum),
+                "net_external_flow": net_external_flow,
+                "reconciliation_pnl": reconciliation_pnl,
+            }
+        )
 
     return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
 
@@ -587,7 +666,7 @@ def get_team_metrics_data() -> dict[str, pd.DataFrame]:
         snapshots_df = load_all_portfolio_snapshots(session)
 
     if snapshots_df.empty:
-        return {"team_metrics": pd.DataFrame(), "correlation_matrix": pd.DataFrame()}
+        return {"team_metrics": pd.DataFrame(), "correlation_matrix": pd.DataFrame(), "pod_market_betas": pd.DataFrame()}
 
     team_returns: dict[str, pd.Series] = {}
     for team in TEAM_ORDER:
@@ -606,13 +685,13 @@ def get_team_metrics_data() -> dict[str, pd.DataFrame]:
             team_returns[team] = series
 
     if not team_returns:
-        return {"team_metrics": pd.DataFrame(), "correlation_matrix": pd.DataFrame()}
+        return {"team_metrics": pd.DataFrame(), "correlation_matrix": pd.DataFrame(), "pod_market_betas": pd.DataFrame()}
 
     snapshot_df = get_base_snapshot()
     analytics = get_risk_analytics(snapshot_df)
     factor_returns_df = analytics.get("factor_returns", pd.DataFrame())
     if factor_returns_df.empty or "MKT" not in factor_returns_df.columns:
-        return {"team_metrics": pd.DataFrame(), "correlation_matrix": pd.DataFrame()}
+        return {"team_metrics": pd.DataFrame(), "correlation_matrix": pd.DataFrame(), "pod_market_betas": pd.DataFrame()}
 
     benchmark_returns = pd.Series(
         pd.to_numeric(factor_returns_df["MKT"], errors="coerce").values,
@@ -624,14 +703,16 @@ def get_team_metrics_data() -> dict[str, pd.DataFrame]:
     returns_df = returns_df.join(benchmark_returns.rename("benchmark"), how="inner").dropna()
     team_columns = [col for col in returns_df.columns if col != "benchmark"]
     if returns_df.empty or not team_columns:
-        return {"team_metrics": pd.DataFrame(), "correlation_matrix": pd.DataFrame()}
+        return {"team_metrics": pd.DataFrame(), "correlation_matrix": pd.DataFrame(), "pod_market_betas": pd.DataFrame()}
 
     rows = []
+    beta_rows = []
     for team in team_columns:
         team_series = pd.to_numeric(returns_df[team], errors="coerce").dropna()
         if len(team_series) < 60:
             continue
         active = pd.to_numeric(returns_df[team] - returns_df["benchmark"], errors="coerce").dropna()
+        beta_mkt = _compute_series_beta(returns_df[team], returns_df["benchmark"])
         tracking_error = _compute_tracking_error(active)
         information_ratio = _compute_information_ratio(active)
         calmar_ratio = _compute_calmar_ratio(team_series)
@@ -645,10 +726,17 @@ def get_team_metrics_data() -> dict[str, pd.DataFrame]:
                 "skew": skew,
             }
         )
+        if beta_mkt is not None:
+            beta_rows.append({"team": team, "beta_mkt": beta_mkt})
 
     team_metrics_df = pd.DataFrame(rows).set_index("team") if rows else pd.DataFrame(columns=["tracking_error", "information_ratio", "calmar_ratio", "skew"])
+    pod_market_betas_df = pd.DataFrame(beta_rows).set_index("team") if beta_rows else pd.DataFrame(columns=["beta_mkt"])
     correlation_matrix = returns_df.drop(columns="benchmark", errors="ignore").corr() if len(team_columns) >= 2 else pd.DataFrame()
-    return {"team_metrics": team_metrics_df, "correlation_matrix": correlation_matrix}
+    return {
+        "team_metrics": team_metrics_df,
+        "correlation_matrix": correlation_matrix,
+        "pod_market_betas": pod_market_betas_df,
+    }
 
 
 def get_fund_metrics(portfolio_returns_df: pd.DataFrame, factor_returns_df: pd.DataFrame) -> dict[str, float | None]:
@@ -950,6 +1038,7 @@ def render_risk_decomposition(risk_decomposition_df: pd.DataFrame, reason: str |
 def _build_scenario_pod_returns(
     snapshot_df: pd.DataFrame,
     holdings_signals_df: pd.DataFrame,
+    pod_market_betas: dict[str, float] | None,
     shock_mkt: float,
     shock_smb: float,
     shock_mom: float,
@@ -968,7 +1057,10 @@ def _build_scenario_pod_returns(
     working["market_value"] = pd.to_numeric(working.get("market_value"), errors="coerce").fillna(0.0)
     working["weight"] = pd.to_numeric(working.get("weight"), errors="coerce").fillna(0.0)
 
-    working["market_exposure_contribution"] = working["weight"]
+    beta_map = pod_market_betas or {}
+    working["pod_beta_mkt"] = working[COL_TEAM].map(beta_map)
+    working["pod_beta_mkt"] = pd.to_numeric(working["pod_beta_mkt"], errors="coerce").fillna(1.0)
+    working["market_exposure_contribution"] = working["weight"] * working["pod_beta_mkt"]
     working["size_contribution"] = 0.0
     working["momentum_contribution"] = 0.0
     working["value_contribution"] = 0.0
@@ -1002,6 +1094,7 @@ def _build_scenario_pod_returns(
         working.groupby(COL_TEAM, dropna=False)
         .agg(
             pod_weight=("weight", "sum"),
+            pod_beta_mkt=("pod_beta_mkt", "last"),
             portfolio_return_contribution=("scenario_return_estimate", "sum"),
         )
         .reset_index()
@@ -1018,7 +1111,7 @@ def _build_scenario_pod_returns(
     )
 
     pod_df = pod_df.rename(columns={COL_TEAM: "Pod"})
-    pod_df = pod_df[["Pod", "Expected Return"]].sort_values("Expected Return", ascending=True).reset_index(drop=True)
+    pod_df = pod_df[["Pod", "Expected Return", "pod_beta_mkt"]].sort_values("Expected Return", ascending=True).reset_index(drop=True)
     return pod_df
 
 def render_scenario_pod_heatmap(pod_returns_df: pd.DataFrame) -> None:
@@ -1117,6 +1210,7 @@ def render_scenario_analysis(
     scenario_template_df: pd.DataFrame,
     snapshot_df: pd.DataFrame,
     holdings_signals_df: pd.DataFrame,
+    pod_market_betas_df: pd.DataFrame,
     reason: str | None = None,
 ) -> None:
     st.subheader("Scenario Library")
@@ -1196,6 +1290,11 @@ def render_scenario_analysis(
         shock_mom = scenario_mom
         shock_val = scenario_val
 
+    pod_market_betas = (
+        pd.to_numeric(pod_market_betas_df.get("beta_mkt"), errors="coerce").dropna().to_dict()
+        if not pod_market_betas_df.empty else {}
+    )
+
     expected_portfolio_return = (
         latest_loadings["beta_mkt"] * shock_mkt
         + latest_loadings["beta_smb"] * shock_smb
@@ -1215,6 +1314,7 @@ def render_scenario_analysis(
     pod_returns_df = _build_scenario_pod_returns(
         snapshot_df=snapshot_df,
         holdings_signals_df=holdings_signals_df,
+        pod_market_betas=pod_market_betas,
         shock_mkt=shock_mkt,
         shock_smb=shock_smb,
         shock_mom=shock_mom,
@@ -1226,6 +1326,7 @@ def render_scenario_analysis(
     recommendations_df = _build_scenario_trade_recommendations(
         snapshot_df=snapshot_df,
         holdings_signals_df=holdings_signals_df,
+        pod_market_betas=pod_market_betas,
         shock_mkt=shock_mkt,
         shock_smb=shock_smb,
         shock_mom=shock_mom,
@@ -1407,6 +1508,7 @@ def main() -> None:
         analytics.get("scenario_template", pd.DataFrame()),
         snapshot_df,
         analytics.get("holdings_signals", {}).get("weighted_signal_contributions", pd.DataFrame()),
+        team_metrics_data.get("pod_market_betas", pd.DataFrame()),
         analytics.get("portfolio_factor_betas", {}).get("reason"),
     )
     st.divider()
