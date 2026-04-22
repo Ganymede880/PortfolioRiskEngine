@@ -34,9 +34,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from src.analytics.portfolio import build_current_portfolio_snapshot
+from src.analytics.ledger import apply_cash_ledger_entries_to_positions, apply_trades_to_positions
 from src.config.settings import settings
 from src.data.price_fetcher import _yfinance_request_context, fetch_latest_prices
-from src.db.crud import load_position_state
+from src.db.crud import get_latest_position_state_date, load_cash_ledger, load_position_state, load_trade_receipts
 from src.db.session import session_scope
 from src.utils.ui import apply_app_theme, render_page_title, render_top_nav
 
@@ -249,16 +250,75 @@ def _cash_like_mask(df: pd.DataFrame) -> pd.Series:
     return ticker.isin({"CASH", "EUR", "GBP", "NOGXX"}) | team.eq("CASH") | position_side.eq("CASH")
 
 
+def _normalize_earnings_ticker(value: object) -> str:
+    ticker = str(value).strip().upper()
+    ticker = ticker.replace("/", "-")
+    if ticker == "BRKB":
+        return "BRK-B"
+    if ticker == "BRKA":
+        return "BRK-A"
+    return ticker
+
+
+def _ticker_aliases(value: object) -> set[str]:
+    normalized = _normalize_earnings_ticker(value)
+    if not normalized:
+        return set()
+
+    aliases = {normalized}
+    compact = normalized.replace("-", "").replace(".", "")
+    if compact:
+        aliases.add(compact)
+
+    if "-" in normalized:
+        aliases.add(normalized.replace("-", "."))
+        aliases.add(normalized.replace("-", ""))
+    if "." in normalized:
+        aliases.add(normalized.replace(".", "-"))
+        aliases.add(normalized.replace(".", ""))
+
+    return {alias for alias in aliases if alias}
+
+
 @st.cache_data(ttl=settings.price_refresh_interval_seconds)
 def get_holdings_universe() -> pd.DataFrame:
     with session_scope() as session:
-        position_state_df = load_position_state(session)
+        latest_state_date = get_latest_position_state_date(session)
+        position_state_df = load_position_state(session, as_of_date=latest_state_date)
+        trades_df = pd.DataFrame()
+        cash_df = pd.DataFrame()
+
+        if latest_state_date is not None:
+            start_date = pd.to_datetime(latest_state_date) + pd.Timedelta(days=1)
+            end_date = pd.Timestamp.today().normalize().date()
+            trades_df = load_trade_receipts(
+                session=session,
+                start_date=start_date.date(),
+                end_date=end_date,
+            )
+            cash_df = load_cash_ledger(
+                session=session,
+                start_date=start_date.date(),
+                end_date=end_date,
+            )
 
     if position_state_df.empty:
         return pd.DataFrame(columns=[COL_TICKER, COL_TEAM, COL_MARKET_VALUE])
 
+    carried_positions_df = position_state_df.copy()
+    if not trades_df.empty:
+        carried_positions_df, _ = apply_trades_to_positions(
+            base_positions_df=carried_positions_df,
+            trades_df=trades_df,
+        )
+    if not cash_df.empty:
+        carried_positions_df = apply_cash_ledger_entries_to_positions(
+            positions_df=carried_positions_df,
+            cash_entries_df=cash_df,
+        )
+
     tickers = (
-        position_state_df[COL_TICKER]
+        carried_positions_df[COL_TICKER]
         .dropna()
         .astype(str)
         .str.strip()
@@ -267,7 +327,7 @@ def get_holdings_universe() -> pd.DataFrame:
         .tolist()
     )
     latest_prices_df, _ = fetch_latest_prices(tickers)
-    snapshot_df = build_current_portfolio_snapshot(position_state_df, latest_prices_df)
+    snapshot_df = build_current_portfolio_snapshot(carried_positions_df, latest_prices_df)
     if snapshot_df.empty:
         return pd.DataFrame(columns=[COL_TICKER, COL_TEAM, COL_MARKET_VALUE])
 
@@ -275,7 +335,7 @@ def get_holdings_universe() -> pd.DataFrame:
     if snapshot_df.empty:
         return pd.DataFrame(columns=[COL_TICKER, COL_TEAM, COL_MARKET_VALUE])
 
-    snapshot_df[COL_TICKER] = snapshot_df[COL_TICKER].astype(str).str.strip().str.upper()
+    snapshot_df[COL_TICKER] = snapshot_df[COL_TICKER].map(_normalize_earnings_ticker)
     snapshot_df[COL_TEAM] = snapshot_df[COL_TEAM].astype(str).str.strip()
     snapshot_df[COL_MARKET_VALUE] = pd.to_numeric(snapshot_df.get(COL_MARKET_VALUE), errors="coerce").fillna(0.0)
     snapshot_df = (
@@ -527,6 +587,7 @@ def _fetch_yahoo_earnings_calendar_for_range(start_date: str, end_date: str) -> 
         .drop(columns=["reported_eps", "reported_eps_missing"], errors="ignore")
         .reset_index(drop=True)
     )
+    combined["ticker"] = combined["ticker"].map(_normalize_earnings_ticker)
     combined["pod"] = pd.NA
     combined["revenue_estimate"] = pd.NA
     return combined[CANONICAL_EVENT_COLUMNS], {"ok": True, "message": None, "fallback_allowed": False}
@@ -661,6 +722,7 @@ def _build_yfinance_calendar_fallback(
         return _empty_events_df()
 
     fallback_df = pd.DataFrame(rows)[CANONICAL_EVENT_COLUMNS]
+    fallback_df["ticker"] = fallback_df["ticker"].map(_normalize_earnings_ticker)
     fallback_df = fallback_df.sort_values(["earnings_date", "ticker"]).drop_duplicates(
         subset=["earnings_date", "ticker"], keep="first"
     )
@@ -768,13 +830,13 @@ def get_earnings_calendar_data(
 
     if selected_universe == "Current Holdings Only":
         ticker_universe = (
-            snapshot_df[COL_TICKER].dropna().astype(str).str.strip().str.upper().unique().tolist()
+            snapshot_df[COL_TICKER].dropna().map(_normalize_earnings_ticker).unique().tolist()
             if not snapshot_df.empty else []
         )
         pod_map = (
             snapshot_df[[COL_TICKER, COL_TEAM]]
             .dropna(subset=[COL_TICKER])
-            .assign(**{COL_TICKER: lambda df: df[COL_TICKER].astype(str).str.strip().str.upper()})
+            .assign(**{COL_TICKER: lambda df: df[COL_TICKER].map(_normalize_earnings_ticker)})
             .drop_duplicates(subset=[COL_TICKER], keep="first")
             .set_index(COL_TICKER)[COL_TEAM]
             .to_dict()
@@ -784,9 +846,14 @@ def get_earnings_calendar_data(
         ticker_universe = [ticker for ticker in custom_tickers if str(ticker).strip()]
         pod_map = {}
 
-    ticker_universe = sorted({str(ticker).strip().upper() for ticker in ticker_universe if str(ticker).strip()})
+    ticker_universe = sorted({_normalize_earnings_ticker(ticker) for ticker in ticker_universe if str(ticker).strip()})
     if not ticker_universe:
         return _empty_events_df()
+    alias_to_canonical = {
+        alias: canonical
+        for canonical in ticker_universe
+        for alias in _ticker_aliases(canonical)
+    }
 
     yahoo_events_df, yahoo_status = _fetch_yahoo_earnings_calendar_for_range(
         start_date=pd.Timestamp(range_start).strftime("%Y-%m-%d"),
@@ -795,11 +862,14 @@ def get_earnings_calendar_data(
 
     filtered = _empty_events_df()
     if not yahoo_events_df.empty:
-        yahoo_events_df["ticker"] = yahoo_events_df["ticker"].astype(str).str.strip().str.upper()
-        filtered = yahoo_events_df.loc[
-            yahoo_events_df["ticker"].isin(ticker_universe)
-        ].copy()
+        yahoo_events_df["ticker"] = yahoo_events_df["ticker"].map(_normalize_earnings_ticker)
+        yahoo_events_df["matched_ticker"] = yahoo_events_df["ticker"].map(
+            lambda ticker: next((alias_to_canonical[alias] for alias in _ticker_aliases(ticker) if alias in alias_to_canonical), pd.NA)
+        )
+        filtered = yahoo_events_df.loc[yahoo_events_df["matched_ticker"].notna()].copy()
         if not filtered.empty:
+            filtered["ticker"] = filtered["matched_ticker"].astype(str)
+            filtered = filtered.drop(columns=["matched_ticker"], errors="ignore")
             filtered = _enrich_with_yfinance_consensus(filtered)
 
     if filtered.empty and bool(yahoo_status.get("fallback_allowed", True)):
@@ -816,6 +886,45 @@ def get_earnings_calendar_data(
     filtered["earnings_date"] = pd.to_datetime(filtered["earnings_date"], errors="coerce")
     filtered = filtered.dropna(subset=["earnings_date"]).sort_values(["earnings_date", "ticker"]).reset_index(drop=True)
     return filtered
+
+
+def build_unmatched_holdings_report(snapshot_df: pd.DataFrame, events_df: pd.DataFrame) -> pd.DataFrame:
+    if snapshot_df.empty:
+        return pd.DataFrame(columns=[COL_TICKER, COL_TEAM, COL_MARKET_VALUE])
+
+    working = snapshot_df[[COL_TICKER, COL_TEAM, COL_MARKET_VALUE]].copy()
+    working[COL_TICKER] = working[COL_TICKER].map(_normalize_earnings_ticker)
+    matched = {
+        _normalize_earnings_ticker(ticker)
+        for ticker in events_df.get("ticker", pd.Series(dtype=str)).dropna().tolist()
+    }
+    report_df = working.loc[~working[COL_TICKER].isin(matched)].copy()
+    report_df[COL_MARKET_VALUE] = pd.to_numeric(report_df[COL_MARKET_VALUE], errors="coerce").fillna(0.0)
+    return report_df.sort_values(COL_MARKET_VALUE, ascending=False).reset_index(drop=True)
+
+
+def render_unmatched_holdings_diagnostics(snapshot_df: pd.DataFrame, events_df: pd.DataFrame) -> None:
+    report_df = build_unmatched_holdings_report(snapshot_df, events_df)
+    with st.expander("Missing Earnings Diagnostics"):
+        st.write(
+            """
+            These are current holdings that do not have a matched earnings event in the
+            current month plus next two months after ticker normalization and alias matching.
+            """
+        )
+        if report_df.empty:
+            st.success("Every current holding matched an upcoming earnings event.")
+            return
+
+        display_df = report_df.rename(
+            columns={
+                COL_TICKER: "Ticker",
+                COL_TEAM: "Pod",
+                COL_MARKET_VALUE: "Market Value",
+            }
+        ).copy()
+        display_df["Market Value"] = pd.to_numeric(display_df["Market Value"], errors="coerce").fillna(0.0)
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
 def _apply_earnings_filters(
@@ -980,6 +1089,8 @@ def main() -> None:
     for tab, window in zip(tabs, windows):
         with tab:
             render_month_tab(events_df, window)
+
+    render_unmatched_holdings_diagnostics(holdings_snapshot_df, events_df)
 
     with st.expander("Methodology Note"):
         st.write(
