@@ -65,6 +65,7 @@ COL_COST_BASIS = "cost_basis_per_share"
 
 FACTOR_COLORS = {
     "Benchmark": SHARED_FACTOR_COLORS["Market"],
+    "Market": SHARED_FACTOR_COLORS["Market"],
     "Size": SHARED_FACTOR_COLORS["Size"],
     "Momentum": SHARED_FACTOR_COLORS["Momentum"],
     "Value": SHARED_FACTOR_COLORS["Value"],
@@ -1042,70 +1043,54 @@ def render_team_factor_loadings(team: str, history_df: pd.DataFrame, analytics: 
         st.info("No flow-adjusted pod return history is available for decomposition.")
         return
 
-    benchmark_history = prepare_flow_adjusted_history(
-        history_df=history_df,
-        value_column="benchmark_aum",
-        flow_column="net_external_flow",
-    )
-    if benchmark_history.empty or "performance_return" not in benchmark_history.columns:
-        st.info("Benchmark return history is unavailable for decomposition.")
-        return
-
     team_returns = (
         team_history[["date", "performance_return"]]
         .rename(columns={"performance_return": "team_return"})
         .copy()
     )
-    benchmark_returns = (
-        benchmark_history[["date", "performance_return"]]
-        .rename(columns={"performance_return": "benchmark_return"})
-        .copy()
-    )
-    factor_inputs = factor_returns_df[["date", "SMB", "MOM", "VAL"]].copy()
+    factor_inputs = factor_returns_df[["date", "MKT", "SMB", "MOM", "VAL"]].copy()
 
     regression_df = (
         team_returns
-        .merge(benchmark_returns, on="date", how="inner")
         .merge(factor_inputs, on="date", how="inner")
     )
     regression_df["date"] = pd.to_datetime(regression_df["date"], errors="coerce")
-    for col in ["team_return", "benchmark_return", "SMB", "MOM", "VAL"]:
+    for col in ["team_return", "MKT", "SMB", "MOM", "VAL"]:
         regression_df[col] = pd.to_numeric(regression_df[col], errors="coerce")
-    regression_df = regression_df.dropna(subset=["date", "team_return", "benchmark_return", "SMB", "MOM", "VAL"])
+    regression_df = regression_df.dropna(subset=["date", "team_return", "MKT", "SMB", "MOM", "VAL"])
     regression_df = regression_df.sort_values("date").reset_index(drop=True)
     if regression_df.empty:
-        st.info("No overlapping pod, benchmark, and factor return history is available for decomposition.")
+        st.info("No overlapping pod and factor return history is available for decomposition.")
         return
 
     end_date = regression_df["date"].max()
     start_date = end_date - pd.Timedelta(days=365)
     regression_df = regression_df.loc[regression_df["date"] >= start_date].copy()
     if len(regression_df) < 20:
-        st.info("N/A: return decomposition needs more overlapping pod, benchmark, and factor observations in the last year.")
+        st.info("N/A: return decomposition needs more overlapping pod and factor observations in the last year.")
         return
 
-    x = regression_df[["benchmark_return", "SMB", "MOM", "VAL"]].to_numpy(dtype=float)
+    x = regression_df[["MKT", "SMB", "MOM", "VAL"]].to_numpy(dtype=float)
     y = regression_df["team_return"].to_numpy(dtype=float)
-    x_with_const = np.column_stack([np.ones(len(regression_df)), x])
     try:
-        coefficients, *_ = np.linalg.lstsq(x_with_const, y, rcond=None)
+        coefficients, *_ = np.linalg.lstsq(x, y, rcond=None)
     except np.linalg.LinAlgError:
         st.info("N/A: return decomposition could not be estimated because the regression inputs are unstable.")
         return
 
-    regression_df["contribution_benchmark"] = coefficients[1] * regression_df["benchmark_return"]
-    regression_df["contribution_smb"] = coefficients[2] * regression_df["SMB"]
-    regression_df["contribution_mom"] = coefficients[3] * regression_df["MOM"]
-    regression_df["contribution_val"] = coefficients[4] * regression_df["VAL"]
+    regression_df["contribution_mkt"] = coefficients[0] * regression_df["MKT"]
+    regression_df["contribution_smb"] = coefficients[1] * regression_df["SMB"]
+    regression_df["contribution_mom"] = coefficients[2] * regression_df["MOM"]
+    regression_df["contribution_val"] = coefficients[3] * regression_df["VAL"]
     regression_df["explained_return"] = regression_df[
-        ["contribution_benchmark", "contribution_smb", "contribution_mom", "contribution_val"]
+        ["contribution_mkt", "contribution_smb", "contribution_mom", "contribution_val"]
     ].sum(axis=1)
     regression_df["residual"] = regression_df["team_return"] - regression_df["explained_return"]
 
     cumulative_df = regression_df[["date"]].copy()
     cumulative_map = {
         "contribution_val": "Value",
-        "contribution_benchmark": "Benchmark",
+        "contribution_mkt": "Market",
         "residual": "Idiosyncratic",
         "contribution_smb": "Size",
         "contribution_mom": "Momentum",
@@ -1143,15 +1128,14 @@ def render_team_factor_loadings(team: str, history_df: pd.DataFrame, analytics: 
     with st.expander("Methodology Note"):
         st.write(
             f"""
-            This decomposition estimates each pod's daily return as a function of its
-            **{describe_team_benchmark(team)}** benchmark return plus the
-            shared **Size**, **Momentum**, and **Value** factor return series over the
-            trailing 1-year window.
+            This decomposition estimates each pod's daily return as a function of the
+            shared **Market**, **Size**, **Momentum**, and **Value** factor return
+            series over the trailing 1-year window.
 
-            The plotted lines show cumulative attributed return from **Benchmark**,
+            The plotted lines show cumulative attributed return from **Market**,
             **Size**, **Momentum**, **Value**, and **Idiosyncratic** return, where
-            idiosyncratic return is the portion of pod performance not explained by
-            the benchmark and style-factor legs.
+            idiosyncratic return is everything in pod performance not explained by
+            those four factor legs.
             """
         )
 

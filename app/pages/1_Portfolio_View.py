@@ -25,7 +25,6 @@ import sys
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +32,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 import src.analytics.exposure as exposure_module
+import src.data.price_fetcher as price_fetcher_module
 from src.analytics.portfolio import (
     build_current_portfolio_snapshot,
     summarize_total_portfolio,
@@ -87,6 +87,40 @@ EXTERNAL_FLOW_ACTIVITY_TYPES = {"SECTOR_REBALANCE", "PORTFOLIO_LIQUIDATION"}
 
 def _get_team_color(team_name: str) -> str:
     return TEAM_COLORS.get(str(team_name).strip(), "#64748b")
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    cleaned = str(hex_color).strip().lstrip("#")
+    if len(cleaned) != 6:
+        return 100, 116, 139
+    return tuple(int(cleaned[idx: idx + 2], 16) for idx in (0, 2, 4))
+
+
+def _rgb_to_hex(rgb: tuple[int, int, int]) -> str:
+    r, g, b = [max(0, min(255, int(channel))) for channel in rgb]
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _blend_hex(hex_color: str, target_rgb: tuple[int, int, int], weight: float) -> str:
+    base_rgb = _hex_to_rgb(hex_color)
+    clamped_weight = max(0.0, min(1.0, weight))
+    blended = tuple(
+        round(base_channel * (1.0 - clamped_weight) + target_channel * clamped_weight)
+        for base_channel, target_channel in zip(base_rgb, target_rgb)
+    )
+    return _rgb_to_hex(blended)
+
+
+def _build_tonal_palette(base_color: str, count: int) -> list[str]:
+    if count <= 0:
+        return []
+    if count == 1:
+        return [base_color]
+    weights = [0.0, 0.16, 0.3, 0.42, 0.22, 0.5, 0.36, 0.58, 0.46, 0.64]
+    return [
+        _blend_hex(base_color, (255, 255, 255), weights[idx % len(weights)])
+        for idx in range(count)
+    ]
 
 
 def _format_currency(value):
@@ -285,6 +319,418 @@ def _render_custom_pod_legend(team_names: list[str]) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def _build_allocation_sunburst_frame(snapshot_df: pd.DataFrame) -> pd.DataFrame:
+    working = snapshot_df.copy()
+    working[COL_MARKET_VALUE] = pd.to_numeric(working[COL_MARKET_VALUE], errors="coerce")
+    working = working.loc[~_cash_like_mask(working)].copy()
+    working = working.loc[working[COL_MARKET_VALUE].fillna(0.0) != 0.0].copy()
+    if working.empty:
+        return pd.DataFrame(columns=["sector", "subsector", COL_MARKET_VALUE])
+
+    working[COL_TEAM] = working[COL_TEAM].astype(str).str.strip()
+    working[COL_TICKER] = working[COL_TICKER].astype(str).str.strip().str.upper()
+    working = working.rename(columns={COL_TEAM: "sector"})
+
+    def _clean_label(value) -> str | None:
+        if value is None or pd.isna(value):
+            return None
+        text = str(value).strip()
+        if not text or text.lower() in {"nan", "none", "null", "n/a", "<na>"}:
+            return None
+        return text
+
+    def _ticker_lookup_keys(ticker: str) -> list[str]:
+        normalized = str(ticker).strip().upper()
+        keys = [normalized]
+        if "-" in normalized:
+            base, suffix = normalized.rsplit("-", 1)
+            if suffix.isalpha() and len(suffix) == 1:
+                keys.append(f"{base}.{suffix}")
+        if "." in normalized:
+            base, suffix = normalized.rsplit(".", 1)
+            if suffix.isalpha() and len(suffix) == 1:
+                keys.append(f"{base}-{suffix}")
+        seen: set[str] = set()
+        return [key for key in keys if key and not (key in seen or seen.add(key))]
+
+    def _build_constituent_subsector_map() -> dict[str, str]:
+        constituents_getter = getattr(exposure_module, "get_sp500_constituents", None)
+        constituents_df = constituents_getter() if callable(constituents_getter) else pd.DataFrame()
+        if constituents_df.empty:
+            return {}
+        normalized = constituents_df.copy()
+        normalized["ticker"] = normalized["ticker"].astype(str).str.strip().str.upper()
+        normalized["gics_sub_industry"] = normalized["gics_sub_industry"].map(_clean_label)
+        normalized = normalized.dropna(subset=["ticker", "gics_sub_industry"]).drop_duplicates(subset=["ticker"])
+        return dict(zip(normalized["ticker"], normalized["gics_sub_industry"]))
+
+    def _is_etf_like(profile_row: dict[str, str | None], ticker: str) -> bool:
+        quote_type = str(profile_row.get("quote_type") or "").strip().upper()
+        category = _clean_label(profile_row.get("category"))
+        fund_family = _clean_label(profile_row.get("fund_family"))
+        known_etfs = {"SPY", "QQQ", "XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU", "XLV", "XLY", "IGV"}
+        return quote_type in {"ETF", "MUTUALFUND"} or bool(category) or bool(fund_family) or ticker in known_etfs
+
+    def _profile_subsector_label(profile_row: dict[str, str | None], fallback_sector: str | None) -> str:
+        industry = _clean_label(profile_row.get("industry"))
+        category = _clean_label(profile_row.get("category"))
+        sector_name = _clean_label(profile_row.get("sector"))
+        quote_type = str(profile_row.get("quote_type") or "").strip().upper()
+
+        if industry:
+            return industry
+        if quote_type in {"ETF", "MUTUALFUND"} and category:
+            return category
+        if sector_name:
+            return sector_name
+        if category:
+            return category
+        if fallback_sector:
+            return f"{fallback_sector} Other"
+        return "Other"
+
+    constituent_subsector_map = _build_constituent_subsector_map()
+    fallback_sector_map = (
+        working[["sector", COL_TICKER]]
+        .dropna()
+        .drop_duplicates(subset=[COL_TICKER])
+        .set_index(COL_TICKER)["sector"]
+        .astype(str)
+        .to_dict()
+    )
+
+    holdings_tickers = sorted(working[COL_TICKER].dropna().astype(str).str.strip().str.upper().unique().tolist())
+    fetch_live_security_profiles = getattr(price_fetcher_module, "fetch_live_security_profiles", None)
+    fetch_etf_top_holdings = getattr(price_fetcher_module, "fetch_etf_top_holdings", None)
+    holdings_profiles_df = (
+        fetch_live_security_profiles(holdings_tickers)
+        if callable(fetch_live_security_profiles)
+        else pd.DataFrame(columns=["ticker", "quote_type", "sector", "industry", "category", "fund_family", "long_name", "short_name"])
+    )
+    profile_map: dict[str, dict[str, str | None]] = {}
+    if not holdings_profiles_df.empty:
+        for row in holdings_profiles_df.to_dict(orient="records"):
+            ticker = str(row.get("ticker", "")).strip().upper()
+            if ticker:
+                profile_map[ticker] = row
+
+    def _resolve_subsector_map(
+        tickers: list[str],
+        sector_map: dict[str, str] | None = None,
+        extra_profiles: dict[str, dict[str, str | None]] | None = None,
+    ) -> dict[str, str]:
+        sector_map = sector_map or {}
+        combined_profiles = dict(profile_map)
+        if extra_profiles:
+            combined_profiles.update(extra_profiles)
+
+        missing = sorted(
+            {
+                ticker
+                for ticker in tickers
+                if ticker
+                and not any(key in constituent_subsector_map for key in _ticker_lookup_keys(ticker))
+                and ticker not in combined_profiles
+            }
+        )
+        if missing:
+            fetched = (
+                fetch_live_security_profiles(missing)
+                if callable(fetch_live_security_profiles)
+                else pd.DataFrame(columns=["ticker", "quote_type", "sector", "industry", "category", "fund_family", "long_name", "short_name"])
+            )
+            if not fetched.empty:
+                for row in fetched.to_dict(orient="records"):
+                    fetched_ticker = str(row.get("ticker", "")).strip().upper()
+                    if fetched_ticker:
+                        combined_profiles[fetched_ticker] = row
+                        profile_map[fetched_ticker] = row
+
+        resolved: dict[str, str] = {}
+        for ticker in tickers:
+            if not ticker:
+                continue
+            resolved_label = None
+            for key in _ticker_lookup_keys(ticker):
+                resolved_label = constituent_subsector_map.get(key)
+                if resolved_label:
+                    break
+            if resolved_label:
+                resolved[ticker] = resolved_label
+                continue
+            profile_row = next(
+                (combined_profiles.get(key) for key in _ticker_lookup_keys(ticker) if combined_profiles.get(key)),
+                {},
+            )
+            resolved[ticker] = _profile_subsector_label(profile_row or {}, sector_map.get(ticker))
+        return resolved
+
+    etf_mask = working[COL_TICKER].map(lambda ticker: _is_etf_like(profile_map.get(ticker, {}), ticker))
+    direct_rows = working.loc[~etf_mask].copy()
+    etf_rows = working.loc[etf_mask].copy()
+
+    allocation_rows: list[dict[str, object]] = []
+    direct_subsector_map = _resolve_subsector_map(
+        direct_rows[COL_TICKER].dropna().astype(str).tolist(),
+        sector_map=fallback_sector_map,
+    )
+    for row in direct_rows.to_dict(orient="records"):
+        ticker = str(row.get(COL_TICKER, "")).strip().upper()
+        allocation_rows.append(
+            {
+                "sector": row.get("sector"),
+                "subsector": direct_subsector_map.get(ticker, f"{row.get('sector')} Other"),
+                COL_MARKET_VALUE: float(pd.to_numeric(pd.Series([row.get(COL_MARKET_VALUE)]), errors="coerce").fillna(0.0).iloc[0]),
+            }
+        )
+
+    etf_holdings_map: dict[str, pd.DataFrame] = {}
+    all_underlying_tickers: set[str] = set()
+    for etf_ticker in etf_rows[COL_TICKER].dropna().astype(str).str.strip().str.upper().unique():
+        holdings_df = fetch_etf_top_holdings(etf_ticker) if callable(fetch_etf_top_holdings) else pd.DataFrame(columns=["ticker", "weight"])
+        etf_holdings_map[etf_ticker] = holdings_df
+        if not holdings_df.empty:
+            all_underlying_tickers.update(holdings_df["ticker"].dropna().astype(str).str.strip().str.upper().tolist())
+
+    underlying_subsector_map = _resolve_subsector_map(sorted(all_underlying_tickers))
+    for row in etf_rows.to_dict(orient="records"):
+        sector_name = str(row.get("sector", "")).strip()
+        ticker = str(row.get(COL_TICKER, "")).strip().upper()
+        market_value = float(pd.to_numeric(pd.Series([row.get(COL_MARKET_VALUE)]), errors="coerce").fillna(0.0).iloc[0])
+        holdings_df = etf_holdings_map.get(ticker, pd.DataFrame())
+        if holdings_df.empty:
+            fallback_label = _resolve_subsector_map([ticker], sector_map={ticker: sector_name}).get(ticker, f"{sector_name} ETF Basket")
+            allocation_rows.append({"sector": sector_name, "subsector": fallback_label, COL_MARKET_VALUE: market_value})
+            continue
+
+        expanded = holdings_df.copy()
+        expanded["subsector"] = expanded["ticker"].map(underlying_subsector_map)
+        expanded["subsector"] = expanded["subsector"].fillna(f"{sector_name} Other")
+        expanded = expanded.groupby("subsector", as_index=False)["weight"].sum()
+        total_weight = float(expanded["weight"].sum())
+        if total_weight <= 0:
+            allocation_rows.append({"sector": sector_name, "subsector": f"{sector_name} ETF Basket", COL_MARKET_VALUE: market_value})
+            continue
+        expanded["weight"] = expanded["weight"] / total_weight
+        for slice_row in expanded.to_dict(orient="records"):
+            allocation_rows.append(
+                {
+                    "sector": sector_name,
+                    "subsector": slice_row["subsector"],
+                    COL_MARKET_VALUE: market_value * float(slice_row["weight"]),
+                }
+            )
+
+    allocation_df = pd.DataFrame(allocation_rows)
+    if allocation_df.empty:
+        return pd.DataFrame(columns=["sector", "subsector", COL_MARKET_VALUE])
+
+    allocation_df["subsector"] = allocation_df["subsector"].map(_clean_label).fillna("Other")
+    return (
+        allocation_df.groupby(["sector", "subsector"], as_index=False)[COL_MARKET_VALUE]
+        .sum()
+        .sort_values([COL_MARKET_VALUE, "sector", "subsector"], ascending=[False, True, True])
+        .reset_index(drop=True)
+    )
+
+
+def _clean_display_label(value) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null", "n/a", "<na>"}:
+        return None
+    return text
+
+
+def _map_sp500_sector_to_team(gics_sector: str | None) -> str | None:
+    sector_name = _clean_display_label(gics_sector)
+    if sector_name is None:
+        return None
+
+    mapping = {
+        "Consumer Discretionary": "Consumer",
+        "Consumer Staples": "Consumer",
+        "Energy": "E&U",
+        "Utilities": "E&U",
+        "Financials": "F&R",
+        "Real Estate": "F&R",
+        "Health Care": "Healthcare",
+        "Information Technology": "TMT",
+        "Communication Services": "TMT",
+        "Industrials": "M&I",
+        "Materials": "M&I",
+    }
+    return mapping.get(sector_name)
+
+
+def _build_sp500_sunburst_frame() -> pd.DataFrame:
+    constituents_getter = getattr(exposure_module, "get_sp500_constituents", None)
+    constituents_df = constituents_getter() if callable(constituents_getter) else pd.DataFrame()
+    if constituents_df.empty:
+        return pd.DataFrame(columns=["sector", "subsector", COL_MARKET_VALUE])
+
+    working = constituents_df.copy()
+    working["sector"] = working["gics_sector"].map(_map_sp500_sector_to_team)
+    working["subsector"] = working["gics_sub_industry"].map(_clean_display_label)
+    working = working.dropna(subset=["sector", "subsector"]).copy()
+    if working.empty:
+        return pd.DataFrame(columns=["sector", "subsector", COL_MARKET_VALUE])
+
+    live_sp500_weights = fetch_sp500_sector_group_weights()
+    grouped = (
+        working.groupby(["sector", "subsector"], as_index=False)
+        .size()
+        .rename(columns={"size": "constituent_count"})
+    )
+    grouped["sector_weight"] = pd.to_numeric(grouped["sector"].map(live_sp500_weights), errors="coerce")
+    grouped = grouped.loc[grouped["sector_weight"].notna() & grouped["sector_weight"].gt(0)].copy()
+    if grouped.empty:
+        return pd.DataFrame(columns=["sector", "subsector", COL_MARKET_VALUE])
+
+    sector_counts = grouped.groupby("sector")["constituent_count"].transform("sum")
+    grouped[COL_MARKET_VALUE] = grouped["sector_weight"] * (grouped["constituent_count"] / sector_counts)
+    return (
+        grouped[["sector", "subsector", COL_MARKET_VALUE]]
+        .sort_values([COL_MARKET_VALUE, "sector", "subsector"], ascending=[False, True, True])
+        .reset_index(drop=True)
+    )
+
+
+def _build_allocation_sunburst_figure(
+    allocation_df: pd.DataFrame,
+    value_label: str,
+) -> go.Figure:
+    if allocation_df.empty:
+        return go.Figure()
+
+    sector_totals_df = (
+        allocation_df.groupby("sector", as_index=False)[COL_MARKET_VALUE]
+        .sum()
+        .sort_values(COL_MARKET_VALUE, ascending=False)
+        .reset_index(drop=True)
+    )
+    total_value = float(pd.to_numeric(sector_totals_df[COL_MARKET_VALUE], errors="coerce").fillna(0.0).sum())
+    subsector_nodes: list[dict[str, object]] = []
+    for sector_name in sector_totals_df["sector"].astype(str).tolist():
+        sector_slice = (
+            allocation_df.loc[allocation_df["sector"].astype(str) == sector_name, ["subsector", COL_MARKET_VALUE]]
+            .sort_values(COL_MARKET_VALUE, ascending=False)
+            .reset_index(drop=True)
+        )
+        palette = _build_tonal_palette(_get_team_color(sector_name), len(sector_slice))
+        for idx, row in enumerate(sector_slice.to_dict(orient="records")):
+            subsector_nodes.append(
+                {
+                    "id": f"{sector_name}::{row['subsector']}",
+                    "label": row["subsector"],
+                    "parent": sector_name,
+                    "value": row[COL_MARKET_VALUE],
+                    "color": palette[idx],
+                    "text": "",
+                }
+            )
+
+    sector_nodes = [
+        {
+            "id": sector_name,
+            "label": sector_name,
+            "parent": "",
+            "value": row[COL_MARKET_VALUE],
+            "color": _get_team_color(sector_name),
+            "text": (
+                f"{float(row[COL_MARKET_VALUE]) / total_value:.0%}"
+                if total_value > 0
+                else ""
+            ),
+        }
+        for sector_name, row in zip(sector_totals_df["sector"].astype(str).tolist(), sector_totals_df.to_dict(orient="records"))
+    ]
+    node_df = pd.DataFrame(sector_nodes + subsector_nodes)
+
+    fig = go.Figure(
+        go.Sunburst(
+            ids=node_df["id"],
+            labels=node_df["label"],
+            parents=node_df["parent"],
+            values=node_df["value"],
+            branchvalues="total",
+            sort=False,
+            marker=dict(colors=node_df["color"], line=dict(color="rgba(0,0,0,0)", width=0)),
+            text=node_df["text"],
+            textinfo="text",
+            insidetextorientation="horizontal",
+            insidetextfont=dict(color="#FFFFFF", size=14),
+            hovertemplate=f"<b>%{{label}}</b><br>{value_label}: %{{value:,.2f}}<br>Weight: %{{percentRoot:.1%}}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        height=520,
+        margin=dict(t=10, b=10, l=0, r=0),
+    )
+    return fig
+
+
+def _render_sector_tilt_heatmap(team_summary: pd.DataFrame, live_sp500_weights: dict[str, float | None]) -> None:
+    heatmap_df = team_summary.copy()
+    heatmap_df["sp500_weight"] = pd.to_numeric(heatmap_df[COL_TEAM].map(live_sp500_weights), errors="coerce")
+    heatmap_df["sector_tilt"] = (
+        pd.to_numeric(heatmap_df[COL_WEIGHT], errors="coerce").fillna(0.0)
+        - heatmap_df["sp500_weight"].fillna(0.0)
+    )
+    pod_order = [team for team in settings.display_team_order if team in heatmap_df[COL_TEAM].astype(str).tolist()]
+    plot_df = (
+        heatmap_df.set_index(COL_TEAM)[["sector_tilt"]]
+        .T.reindex(columns=pod_order)
+        .dropna(how="all")
+    )
+    if plot_df.empty:
+        st.info("Sector tilt heatmap is unavailable.")
+        return
+
+    numeric_values = pd.to_numeric(pd.Series(plot_df.to_numpy().ravel()), errors="coerce").dropna()
+    max_abs = float(numeric_values.abs().max()) if not numeric_values.empty else 0.0
+    if not np.isfinite(max_abs) or max_abs == 0:
+        max_abs = 0.01
+
+    fig = px.imshow(
+        plot_df,
+        color_continuous_scale="RdBu",
+        aspect="auto",
+        zmin=-max_abs,
+        zmax=max_abs,
+    )
+    fig.update_traces(
+        text=plot_df.copy().map(_format_percent).to_numpy(),
+        texttemplate="%{text}",
+        textfont=dict(size=16),
+    )
+    fig.update_layout(
+        height=170,
+        margin=dict(t=10, b=20, l=0, r=0),
+    )
+    fig.update_coloraxes(showscale=False, cmid=0.0)
+    fig.update_xaxes(title_text="", tickfont=dict(size=14))
+    fig.update_yaxes(title_text="", showticklabels=False, automargin=False, fixedrange=True, ticks="")
+    fig.update_layout(
+        annotations=[
+            dict(
+                x=-0.02,
+                y=0.5,
+                xref="paper",
+                yref="paper",
+                text="Sector Tilt",
+                textangle=-90,
+                showarrow=False,
+                font=dict(size=14, color="#E2E8F0"),
+                xanchor="center",
+                yanchor="middle",
+            )
+        ]
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def _prepare_master_performance_history(history_df: pd.DataFrame) -> pd.DataFrame:
@@ -825,9 +1271,9 @@ def get_period_pod_relative_returns(snapshot_df: pd.DataFrame, lookback_days: in
     if factor_returns_df.empty:
         return pd.DataFrame(columns=["Pod", "Active Return", "Pure Alpha"])
 
-    factor_inputs = factor_returns_df[["date", "SMB", "MOM", "VAL"]].copy()
+    factor_inputs = factor_returns_df[["date", "MKT", "SMB", "MOM", "VAL"]].copy()
     factor_inputs["date"] = pd.to_datetime(factor_inputs["date"], errors="coerce")
-    for col in ["SMB", "MOM", "VAL"]:
+    for col in ["MKT", "SMB", "MOM", "VAL"]:
         factor_inputs[col] = pd.to_numeric(factor_inputs[col], errors="coerce")
     factor_inputs = factor_inputs.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     if factor_inputs.empty:
@@ -873,9 +1319,9 @@ def get_period_pod_relative_returns(snapshot_df: pd.DataFrame, lookback_days: in
             .merge(factor_inputs, on="date", how="inner")
         )
         regression_df["date"] = pd.to_datetime(regression_df["date"], errors="coerce")
-        for col in ["team_return", "benchmark_return", "SMB", "MOM", "VAL"]:
+        for col in ["team_return", "benchmark_return", "MKT", "SMB", "MOM", "VAL"]:
             regression_df[col] = pd.to_numeric(regression_df[col], errors="coerce")
-        regression_df = regression_df.dropna(subset=["date", "team_return", "benchmark_return", "SMB", "MOM", "VAL"])
+        regression_df = regression_df.dropna(subset=["date", "team_return", "benchmark_return", "MKT", "SMB", "MOM", "VAL"])
         regression_df = regression_df.sort_values("date").reset_index(drop=True)
         if regression_df.empty:
             continue
@@ -886,19 +1332,18 @@ def get_period_pod_relative_returns(snapshot_df: pd.DataFrame, lookback_days: in
         if len(trailing_regression_df) < 20:
             continue
 
-        x = trailing_regression_df[["benchmark_return", "SMB", "MOM", "VAL"]].to_numpy(dtype=float)
+        x = trailing_regression_df[["MKT", "SMB", "MOM", "VAL"]].to_numpy(dtype=float)
         y = trailing_regression_df["team_return"].to_numpy(dtype=float)
-        x_with_const = np.column_stack([np.ones(len(trailing_regression_df)), x])
         try:
-            coefficients, *_ = np.linalg.lstsq(x_with_const, y, rcond=None)
+            coefficients, *_ = np.linalg.lstsq(x, y, rcond=None)
         except np.linalg.LinAlgError:
             continue
 
         regression_df["explained_return"] = (
-            coefficients[1] * regression_df["benchmark_return"]
-            + coefficients[2] * regression_df["SMB"]
-            + coefficients[3] * regression_df["MOM"]
-            + coefficients[4] * regression_df["VAL"]
+            coefficients[0] * regression_df["MKT"]
+            + coefficients[1] * regression_df["SMB"]
+            + coefficients[2] * regression_df["MOM"]
+            + coefficients[3] * regression_df["VAL"]
         )
         regression_df["residual"] = regression_df["team_return"] - regression_df["explained_return"]
         regression_df["active_return"] = regression_df["team_return"] - regression_df["benchmark_return"]
@@ -1699,15 +2144,21 @@ def _render_period_heatmap(
     )
     fig.update_layout(
         height=320,
-        margin=dict(t=20, b=20, l=92),
+        margin=dict(t=20, b=20, l=46, r=0),
     )
     fig.update_coloraxes(showscale=False, cmid=0.0)
     fig.update_xaxes(title_text="")
-    fig.update_yaxes(title_text="", showticklabels=False)
+    fig.update_yaxes(
+        title_text="",
+        showticklabels=False,
+        automargin=False,
+        fixedrange=True,
+        ticks="",
+    )
     fig.update_layout(
         annotations=[
             dict(
-                x=-0.018,
+                x=-0.028,
                 y=0.75,
                 xref="paper",
                 yref="paper",
@@ -1717,9 +2168,12 @@ def _render_period_heatmap(
                 font=dict(size=14, color="#E2E8F0"),
                 xanchor="center",
                 yanchor="middle",
+                align="center",
+                bgcolor="rgba(15, 23, 42, 0.0)",
+                borderpad=0,
             ),
             dict(
-                x=-0.018,
+                x=-0.028,
                 y=0.25,
                 xref="paper",
                 yref="paper",
@@ -1729,6 +2183,9 @@ def _render_period_heatmap(
                 font=dict(size=14, color="#E2E8F0"),
                 xanchor="center",
                 yanchor="middle",
+                align="center",
+                bgcolor="rgba(15, 23, 42, 0.0)",
+                borderpad=0,
             ),
         ]
     )
@@ -1807,41 +2264,6 @@ def render_team_allocation(snapshot_df: pd.DataFrame) -> None:
         return
 
     live_sp500_weights = fetch_sp500_sector_group_weights()
-    display_df = team_summary.copy()
-    display_df["sp500_weight"] = display_df[COL_TEAM].map(live_sp500_weights)
-    display_df["sp500_weight"] = pd.to_numeric(display_df["sp500_weight"], errors="coerce")
-    display_df["sector_tilt"] = pd.NA
-    valid_market_weight_mask = display_df["sp500_weight"].notna()
-    display_df.loc[valid_market_weight_mask, "sector_tilt"] = (
-        pd.to_numeric(display_df.loc[valid_market_weight_mask, COL_WEIGHT], errors="coerce").fillna(0.0)
-        - pd.to_numeric(display_df.loc[valid_market_weight_mask, "sp500_weight"], errors="coerce").fillna(0.0)
-    )
-
-    formatted_df = display_df.rename(
-        columns={
-            COL_TEAM: "Pod",
-            COL_MARKET_VALUE: "Market Value",
-            COL_WEIGHT: "Current Weight",
-            "position_count": "Positions",
-            "sp500_weight": "S&P 500 Weight",
-            "sector_tilt": "Sector Tilt",
-        }
-    ).copy()
-    formatted_df["Market Value"] = formatted_df["Market Value"].map(_format_currency)
-    formatted_df["Current Weight"] = formatted_df["Current Weight"].map(_format_percent)
-    formatted_df["S&P 500 Weight"] = formatted_df["S&P 500 Weight"].map(_format_percent)
-    formatted_df["Sector Tilt"] = formatted_df["Sector Tilt"].map(_format_percent)
-    formatted_df["Positions"] = pd.to_numeric(formatted_df["Positions"], errors="coerce").fillna(0).astype(int).map(lambda x: f"{x:,}")
-
-    st.dataframe(
-        formatted_df[
-            ["Pod", "Market Value", "Current Weight", "S&P 500 Weight", "Sector Tilt", "Positions"]
-        ].style.set_properties(**{"text-align": "left"}).set_table_styles(
-            [{"selector": "th", "props": [("text-align", "left")]}]
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
 
     plot_df = team_summary.loc[
         pd.to_numeric(team_summary[COL_MARKET_VALUE], errors="coerce").fillna(0.0) != 0
@@ -1851,58 +2273,50 @@ def render_team_allocation(snapshot_df: pd.DataFrame) -> None:
         st.info("No allocation data available for charting.")
         return
 
-    holdings_plot_df = snapshot_df.copy()
-    holdings_plot_df[COL_MARKET_VALUE] = pd.to_numeric(holdings_plot_df[COL_MARKET_VALUE], errors="coerce")
-    holdings_plot_df = holdings_plot_df.loc[~_cash_like_mask(holdings_plot_df)].copy()
-    holdings_plot_df = holdings_plot_df.sort_values(COL_MARKET_VALUE, ascending=False).head(10)
-    combo_fig = make_subplots(
-        rows=1,
-        cols=2,
-        specs=[[{"type": "domain"}, {"type": "xy"}]],
-        subplot_titles=("<b>CURRENT PORTFOLIO ALLOCATION</b>", "<b>TOP 10 HOLDINGS BY MARKET VALUE</b>"),
-        column_widths=[0.45, 0.55],
-        horizontal_spacing=0.12,
-    )
+    sunburst_df = _build_allocation_sunburst_frame(snapshot_df)
+    benchmark_sunburst_df = _build_sp500_sunburst_frame()
+    if sunburst_df.empty and benchmark_sunburst_df.empty:
+        st.info("No allocation data available for charting.")
+        return
 
-    combo_fig.add_trace(
-        go.Pie(
-            labels=plot_df[COL_TEAM],
-            values=pd.to_numeric(plot_df[COL_MARKET_VALUE], errors="coerce").fillna(0.0),
-            marker=dict(colors=[_get_team_color(team) for team in plot_df[COL_TEAM]]),
-            showlegend=False,
-            sort=False,
-        ),
-        row=1,
-        col=1,
-    )
-
-    for _, row in holdings_plot_df.iterrows():
-        team = str(row.get(COL_TEAM, "")).strip()
-        combo_fig.add_trace(
-            go.Bar(
-                x=[float(pd.to_numeric(pd.Series([row.get(COL_MARKET_VALUE)]), errors="coerce").fillna(0.0).iloc[0])],
-                y=[str(row.get(COL_TICKER, ""))],
-                orientation="h",
-                name=team,
-                marker_color=_get_team_color(team),
-                showlegend=False,
-            ),
-            row=1,
-            col=2,
+    left_col, right_col = st.columns(2)
+    with left_col:
+        st.markdown(
+            '<div style="color:#FFFFFF;font-weight:700;font-size:1.05rem;letter-spacing:0.04em;text-align:center;"><b>CURRENT PORTFOLIO ALLOCATION</b></div>',
+            unsafe_allow_html=True,
         )
+        if sunburst_df.empty:
+            st.info("Current portfolio allocation is unavailable.")
+        else:
+            st.plotly_chart(
+                _build_allocation_sunburst_figure(sunburst_df, "Value"),
+                use_container_width=True,
+            )
 
-    combo_fig.update_annotations(font=dict(size=16), yshift=12)
-    combo_fig.update_xaxes(title_text="MARKET VALUE", row=1, col=2)
-    combo_fig.update_yaxes(title_text="TICKER", row=1, col=2, categoryorder="total ascending")
-    combo_fig.update_layout(
-        showlegend=False,
-        margin=dict(t=125, b=40),
+    with right_col:
+        st.markdown(
+            '<div style="color:#FFFFFF;font-weight:700;font-size:1.05rem;letter-spacing:0.04em;text-align:center;"><b>LIVE S&amp;P 500 ALLOCATION</b></div>',
+            unsafe_allow_html=True,
+        )
+        if benchmark_sunburst_df.empty:
+            st.info("S&P 500 allocation is unavailable.")
+        else:
+            st.plotly_chart(
+                _build_allocation_sunburst_figure(benchmark_sunburst_df, "Weight"),
+                use_container_width=True,
+            )
+
+    st.markdown(
+        '<div style="color:#FFFFFF;font-weight:700;font-size:1.05rem;letter-spacing:0.04em;text-align:center;"><b>SECTOR TILTS</b></div>',
+        unsafe_allow_html=True,
     )
+    _render_sector_tilt_heatmap(team_summary, live_sp500_weights)
 
-    st.plotly_chart(combo_fig, use_container_width=True)
     legend_teams = [
         team for team in settings.display_team_order
-        if team in set(plot_df[COL_TEAM].astype(str).tolist()) or team in set(holdings_plot_df[COL_TEAM].astype(str).tolist())
+        if team in set(plot_df[COL_TEAM].astype(str).tolist())
+        or team in set(sunburst_df["sector"].astype(str).tolist())
+        or team in set(benchmark_sunburst_df["sector"].astype(str).tolist())
     ]
     _render_custom_pod_legend(legend_teams)
 

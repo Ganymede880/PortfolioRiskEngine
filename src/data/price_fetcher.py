@@ -18,7 +18,7 @@ import hashlib
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import yfinance as yf
@@ -57,6 +57,20 @@ def _write_json_cache(cache_path: Path, payload) -> None:
         cache_path.write_text(json.dumps(payload), encoding="utf-8")
     except Exception:
         pass
+
+
+def _clean_text_label(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null", "n/a", "<na>"}:
+        return None
+    return text
+
+
+def _normalize_symbol(value: Any) -> str:
+    cleaned = _clean_text_label(value)
+    return cleaned.upper() if cleaned else ""
 
 
 def _read_price_cache(cache_path: Path) -> pd.DataFrame:
@@ -228,6 +242,144 @@ SP500_SECTOR_ALIASES: Dict[str, list[str]] = {
         "information technology",
     ],
 }
+
+
+def _normalize_security_profile_payload(ticker: str, info: dict[str, Any] | None) -> dict[str, Any]:
+    info = info if isinstance(info, dict) else {}
+    return {
+        "ticker": _normalize_symbol(ticker),
+        "quote_type": _clean_text_label(info.get("quoteType")),
+        "sector": _clean_text_label(info.get("sector")),
+        "industry": _clean_text_label(info.get("industry")),
+        "category": _clean_text_label(info.get("category")),
+        "fund_family": _clean_text_label(info.get("fundFamily")),
+        "long_name": _clean_text_label(info.get("longName")),
+        "short_name": _clean_text_label(info.get("shortName")),
+    }
+
+
+def _normalize_top_holdings_frame(raw_top_holdings) -> pd.DataFrame:
+    empty = pd.DataFrame(columns=["ticker", "weight"])
+    if raw_top_holdings is None:
+        return empty
+
+    if isinstance(raw_top_holdings, pd.DataFrame):
+        working = raw_top_holdings.reset_index().copy()
+    elif isinstance(raw_top_holdings, dict):
+        working = pd.DataFrame(list(raw_top_holdings.items()), columns=["ticker", "weight"])
+    elif isinstance(raw_top_holdings, list):
+        working = pd.DataFrame(raw_top_holdings)
+    else:
+        return empty
+
+    if working.empty:
+        return empty
+
+    symbol_col = next(
+        (
+            col
+            for col in working.columns
+            if str(col).strip().lower() in {"symbol", "ticker", "holding", "holdingsymbol"}
+        ),
+        None,
+    )
+    if symbol_col is None:
+        object_cols = [col for col in working.columns if pd.api.types.is_object_dtype(working[col])]
+        symbol_col = object_cols[0] if object_cols else None
+    if symbol_col is None:
+        return empty
+
+    weight_col = next(
+        (
+            col
+            for col in working.columns
+            if "weight" in str(col).strip().lower() or "percent" in str(col).strip().lower()
+        ),
+        None,
+    )
+    if weight_col is None:
+        numeric_cols = [
+            col
+            for col in working.columns
+            if col != symbol_col and pd.api.types.is_numeric_dtype(working[col])
+        ]
+        weight_col = numeric_cols[0] if numeric_cols else None
+    if weight_col is None:
+        return empty
+
+    normalized = working[[symbol_col, weight_col]].copy()
+    normalized.columns = ["ticker", "weight"]
+    normalized["ticker"] = normalized["ticker"].map(_normalize_symbol)
+    normalized["weight"] = pd.to_numeric(normalized["weight"], errors="coerce")
+    normalized = normalized.loc[normalized["ticker"].ne("") & normalized["weight"].gt(0)].copy()
+    if normalized.empty:
+        return empty
+
+    weight_sum = float(normalized["weight"].sum())
+    if weight_sum <= 0:
+        return empty
+    normalized["weight"] = normalized["weight"] / weight_sum
+    return normalized.groupby("ticker", as_index=False)["weight"].sum()
+
+
+def fetch_live_security_profiles(tickers: List[str]) -> pd.DataFrame:
+    columns = ["ticker", "quote_type", "sector", "industry", "category", "fund_family", "long_name", "short_name"]
+    unique = sorted({_normalize_symbol(ticker) for ticker in tickers if _normalize_symbol(ticker)})
+    if not unique:
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, Any]] = []
+    for ticker in unique:
+        cache_path = _cache_path_for_named_payload(f"security_profile_{ticker}", ".json")
+        cached = _read_json_cache(cache_path)
+        if _is_cache_fresh(cache_path, settings.price_refresh_interval_seconds) and isinstance(cached, dict):
+            rows.append(_normalize_security_profile_payload(ticker, cached))
+            continue
+
+        payload = None
+        try:
+            with _yfinance_request_context():
+                payload = _normalize_security_profile_payload(ticker, yf.Ticker(ticker).info)
+        except Exception:
+            payload = None
+
+        if payload and any(payload.get(col) for col in columns if col != "ticker"):
+            _write_json_cache(cache_path, payload)
+            rows.append(payload)
+            continue
+
+        if isinstance(cached, dict):
+            rows.append(_normalize_security_profile_payload(ticker, cached))
+        else:
+            rows.append(_normalize_security_profile_payload(ticker, {}))
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def fetch_etf_top_holdings(ticker: str) -> pd.DataFrame:
+    normalized_ticker = _normalize_symbol(ticker)
+    if not normalized_ticker:
+        return pd.DataFrame(columns=["ticker", "weight"])
+
+    cache_path = _cache_path_for_named_payload(f"etf_top_holdings_{normalized_ticker}", ".json")
+    cached = _read_json_cache(cache_path)
+    if _is_cache_fresh(cache_path, settings.price_refresh_interval_seconds) and isinstance(cached, list):
+        return _normalize_top_holdings_frame(cached)
+
+    normalized = pd.DataFrame(columns=["ticker", "weight"])
+    try:
+        with _yfinance_request_context():
+            normalized = _normalize_top_holdings_frame(yf.Ticker(normalized_ticker).funds_data.top_holdings)
+    except Exception:
+        normalized = pd.DataFrame(columns=["ticker", "weight"])
+
+    if not normalized.empty:
+        _write_json_cache(cache_path, normalized.to_dict(orient="records"))
+        return normalized
+
+    if isinstance(cached, list):
+        return _normalize_top_holdings_frame(cached)
+    return normalized
 
 
 def _coerce_sector_weightings(raw_sector_weightings) -> Dict[str, float]:

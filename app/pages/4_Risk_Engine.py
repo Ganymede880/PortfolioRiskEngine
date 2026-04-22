@@ -1144,12 +1144,18 @@ def render_scenario_pod_heatmap(pod_returns_df: pd.DataFrame) -> None:
         textfont=dict(size=16),
     )
     fig.update_layout(
-        margin=dict(t=80, b=20),
+        margin=dict(t=80, b=20, l=0, r=0),
         height=260,
     )
     fig.update_coloraxes(showscale=False, cmid=0.0)
     fig.update_xaxes(title_text="")
-    fig.update_yaxes(title_text="", showticklabels=False)
+    fig.update_yaxes(
+        title_text="",
+        showticklabels=False,
+        automargin=False,
+        ticks="",
+        fixedrange=True,
+    )
     fig = style_plotly_figure(fig, title_text="EXPECTED RETURN BY POD")
     st.plotly_chart(fig, use_container_width=True)
 
