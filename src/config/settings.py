@@ -31,8 +31,19 @@ class Settings:
     project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parents[2])
 
     @property
-    def data_dir(self) -> Path:
+    def repo_data_dir(self) -> Path:
         return self.project_root / "data"
+
+    @property
+    def runtime_data_dir(self) -> Path:
+        configured = os.getenv("APP_DATA_DIR", "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        return self.repo_data_dir
+
+    @property
+    def data_dir(self) -> Path:
+        return self.runtime_data_dir
 
     @property
     def raw_data_dir(self) -> Path:
@@ -44,7 +55,7 @@ class Settings:
 
     @property
     def mappings_dir(self) -> Path:
-        return self.data_dir / "mappings"
+        return self.repo_data_dir / "mappings"
 
     @property
     def cache_dir(self) -> Path:
@@ -136,7 +147,15 @@ class Settings:
     # ---------------------------------------------------------------------
     database_url: str = field(default_factory=lambda: os.getenv(
         "DATABASE_URL",
-        "sqlite:///cmcsif_portfolio.db",
+        (
+            f"sqlite:///{((Path(__file__).resolve().parents[2]) / 'cmcsif_portfolio.db').as_posix()}"
+            if ((Path(__file__).resolve().parents[2]) / "cmcsif_portfolio.db").exists()
+            else (
+                f"sqlite:///{(Path(os.getenv('APP_DATA_DIR', '')).expanduser() / 'cmcsif_portfolio.db').as_posix()}"
+                if os.getenv("APP_DATA_DIR", "").strip()
+                else f"sqlite:///{(Path(__file__).resolve().parents[2] / 'data' / 'cmcsif_portfolio.db').as_posix()}"
+            )
+        ),
     ))
 
     # ---------------------------------------------------------------------

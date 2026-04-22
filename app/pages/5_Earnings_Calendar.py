@@ -38,7 +38,7 @@ from src.analytics.ledger import apply_cash_ledger_entries_to_positions, apply_t
 from src.config.settings import settings
 from src.data.price_fetcher import _yfinance_request_context, fetch_latest_prices
 from src.db.crud import get_latest_position_state_date, load_cash_ledger, load_position_state, load_trade_receipts
-from src.db.session import session_scope
+from src.db.session import init_db, session_scope
 from src.utils.ui import apply_app_theme, render_page_title, render_top_nav
 
 
@@ -1067,6 +1067,7 @@ def main() -> None:
     render_top_nav()
     _apply_page_theme()
     render_page_title("Earnings Calendar")
+    init_db()
 
     holdings_snapshot_df = get_holdings_universe()
 

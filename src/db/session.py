@@ -26,6 +26,7 @@ from src.config.settings import settings
 # SQLAlchemy base class for ORM models
 # ---------------------------------------------------------------------
 Base = declarative_base()
+_DB_INITIALIZED = False
 
 
 # ---------------------------------------------------------------------
@@ -39,16 +40,26 @@ def _build_engine():
     - SQLite needs check_same_thread=False for Streamlit-style access
     """
     database_url = settings.database_url
+    settings.ensure_directories_exist()
 
     if database_url.startswith("sqlite"):
+        sqlite_path = database_url.replace("sqlite:///", "", 1)
+        if sqlite_path and sqlite_path != ":memory:":
+            try:
+                from pathlib import Path
+                Path(sqlite_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
         return create_engine(
             database_url,
             connect_args={"check_same_thread": False},
+            pool_pre_ping=True,
             future=True,
         )
 
     return create_engine(
         database_url,
+        pool_pre_ping=True,
         future=True,
     )
 
@@ -76,6 +87,7 @@ def get_session() -> Session:
 
     Caller is responsible for closing it.
     """
+    ensure_db_initialized()
     return SessionLocal()
 
 
@@ -88,6 +100,7 @@ def session_scope() -> Generator[Session, None, None]:
         with session_scope() as session:
             ...
     """
+    ensure_db_initialized()
     session = SessionLocal()
     try:
         yield session
@@ -108,3 +121,11 @@ def init_db() -> None:
     """
     import src.db.models  # noqa: F401
     Base.metadata.create_all(bind=engine)
+
+
+def ensure_db_initialized() -> None:
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    init_db()
+    _DB_INITIALIZED = True
