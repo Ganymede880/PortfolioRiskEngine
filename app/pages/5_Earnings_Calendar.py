@@ -35,7 +35,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.analytics.portfolio import build_current_portfolio_snapshot
 from src.config.settings import settings
-from src.data.price_fetcher import fetch_latest_prices
+from src.data.price_fetcher import _yfinance_request_context, fetch_latest_prices
 from src.db.crud import load_position_state
 from src.db.session import session_scope
 from src.utils.ui import apply_app_theme, render_page_title, render_top_nav
@@ -594,14 +594,19 @@ def _fetch_yfinance_calendar_for_ticker(ticker: str) -> dict[str, object]:
         return result
 
     try:
-        ticker_obj = yf.Ticker(cleaned_ticker)
+        with _yfinance_request_context():
+            ticker_obj = yf.Ticker(cleaned_ticker)
+            try:
+                calendar_obj = ticker_obj.calendar
+            except Exception:
+                calendar_obj = None
+
+            try:
+                company_name = ticker_obj.info.get("shortName") or ticker_obj.info.get("longName")
+            except Exception:
+                company_name = None
     except Exception:
         return result
-
-    try:
-        calendar_obj = ticker_obj.calendar
-    except Exception:
-        calendar_obj = None
 
     earnings_date = _normalize_calendar_date(
         _first_non_null(
@@ -612,10 +617,6 @@ def _fetch_yfinance_calendar_for_ticker(ticker: str) -> dict[str, object]:
     if earnings_date is not None:
         result["earnings_date"] = earnings_date
 
-    try:
-        company_name = ticker_obj.info.get("shortName") or ticker_obj.info.get("longName")
-    except Exception:
-        company_name = None
     result["company_name"] = company_name
 
     consensus = _fetch_yfinance_consensus_for_ticker(cleaned_ticker)
@@ -694,21 +695,21 @@ def _fetch_yfinance_consensus_for_ticker(ticker: str) -> dict[str, float | None]
         return result
 
     try:
-        ticker_obj = yf.Ticker(cleaned_ticker)
+        with _yfinance_request_context():
+            ticker_obj = yf.Ticker(cleaned_ticker)
+            try:
+                earnings_df = ticker_obj.get_earnings_estimate(as_dict=False)
+                result["eps_estimate"] = _extract_single_near_term_consensus(earnings_df, "avg")
+            except Exception:
+                pass
+
+            try:
+                revenue_df = ticker_obj.get_revenue_estimate(as_dict=False)
+                result["revenue_estimate"] = _extract_single_near_term_consensus(revenue_df, "avg")
+            except Exception:
+                pass
     except Exception:
         return result
-
-    try:
-        earnings_df = ticker_obj.get_earnings_estimate(as_dict=False)
-        result["eps_estimate"] = _extract_single_near_term_consensus(earnings_df, "avg")
-    except Exception:
-        pass
-
-    try:
-        revenue_df = ticker_obj.get_revenue_estimate(as_dict=False)
-        result["revenue_estimate"] = _extract_single_near_term_consensus(revenue_df, "avg")
-    except Exception:
-        pass
 
     return result
 
@@ -787,11 +788,27 @@ def get_earnings_calendar_data(
     if not ticker_universe:
         return _empty_events_df()
 
-    filtered = _build_yfinance_calendar_fallback(
-        ticker_universe=tuple(ticker_universe),
+    yahoo_events_df, yahoo_status = _fetch_yahoo_earnings_calendar_for_range(
         start_date=pd.Timestamp(range_start).strftime("%Y-%m-%d"),
         end_date=pd.Timestamp(range_end).strftime("%Y-%m-%d"),
     )
+
+    filtered = _empty_events_df()
+    if not yahoo_events_df.empty:
+        yahoo_events_df["ticker"] = yahoo_events_df["ticker"].astype(str).str.strip().str.upper()
+        filtered = yahoo_events_df.loc[
+            yahoo_events_df["ticker"].isin(ticker_universe)
+        ].copy()
+        if not filtered.empty:
+            filtered = _enrich_with_yfinance_consensus(filtered)
+
+    if filtered.empty and bool(yahoo_status.get("fallback_allowed", True)):
+        filtered = _build_yfinance_calendar_fallback(
+            ticker_universe=tuple(ticker_universe),
+            start_date=pd.Timestamp(range_start).strftime("%Y-%m-%d"),
+            end_date=pd.Timestamp(range_end).strftime("%Y-%m-%d"),
+        )
+
     if filtered.empty:
         return filtered
 
