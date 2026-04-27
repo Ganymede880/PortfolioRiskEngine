@@ -146,6 +146,18 @@ def _is_cache_fresh(file_path: Path, max_age_seconds: int) -> bool:
     return age < max_age_seconds
 
 
+def _historical_cache_ttl_seconds(lookback_days: int | None = None) -> int:
+    """
+    Historical daily bars change slowly, so keep them much longer than live quotes.
+    """
+    requested_days = int(lookback_days or settings.history_lookback_days)
+    if requested_days >= 365:
+        return 24 * 60 * 60
+    if requested_days >= 90:
+        return 12 * 60 * 60
+    return max(settings.price_refresh_interval_seconds, 6 * 60 * 60)
+
+
 def _cache_covers_start_date(df: pd.DataFrame, start_date: datetime) -> bool:
     if df.empty or "date" not in df.columns:
         return False
@@ -153,6 +165,20 @@ def _cache_covers_start_date(df: pd.DataFrame, start_date: datetime) -> bool:
     if dates.empty:
         return False
     return dates.min() <= pd.Timestamp(start_date).normalize()
+
+
+def _latest_expected_history_date(reference_time: datetime | None = None) -> pd.Timestamp:
+    timestamp = pd.Timestamp(reference_time or datetime.utcnow()).normalize()
+    return pd.bdate_range(end=timestamp, periods=1)[0].normalize()
+
+
+def _cache_covers_end_date(df: pd.DataFrame, end_date: datetime) -> bool:
+    if df.empty or "date" not in df.columns:
+        return False
+    dates = pd.to_datetime(df["date"], errors="coerce").dropna()
+    if dates.empty:
+        return False
+    return dates.max().normalize() >= _latest_expected_history_date(end_date)
 
 
 def _normalize_yfinance_history_frame(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
@@ -638,11 +664,12 @@ def fetch_price_history(
     cache_path = _cache_path_for_ticker(ticker)
     end_date = datetime.utcnow()
     start_date = end_date - timedelta(days=lookback_days)
+    cache_ttl_seconds = _historical_cache_ttl_seconds(lookback_days)
 
     # Use cache if available and fresh
-    if use_cache and _is_cache_fresh(cache_path, settings.price_refresh_interval_seconds):
+    if use_cache and _is_cache_fresh(cache_path, cache_ttl_seconds):
         cached = _read_price_cache(cache_path)
-        if _cache_covers_start_date(cached, start_date):
+        if _cache_covers_start_date(cached, start_date) and _cache_covers_end_date(cached, end_date):
             return cached
 
     try:
@@ -709,13 +736,14 @@ def fetch_multiple_price_histories(
 
     end_date = datetime.utcnow()
     start_date = end_date - timedelta(days=lookback_days or settings.history_lookback_days)
+    cache_ttl_seconds = _historical_cache_ttl_seconds(lookback_days)
     cached_frames: list[pd.DataFrame] = []
     missing_tickers: list[str] = []
 
     for ticker in cleaned:
         cache_path = _cache_path_for_ticker(ticker)
-        cached = _read_price_cache(cache_path) if _is_cache_fresh(cache_path, settings.price_refresh_interval_seconds) else pd.DataFrame()
-        if _cache_covers_start_date(cached, start_date):
+        cached = _read_price_cache(cache_path) if _is_cache_fresh(cache_path, cache_ttl_seconds) else pd.DataFrame()
+        if _cache_covers_start_date(cached, start_date) and _cache_covers_end_date(cached, end_date):
             cached_frames.append(cached)
         else:
             missing_tickers.append(ticker)

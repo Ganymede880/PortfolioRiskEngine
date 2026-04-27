@@ -44,6 +44,7 @@ from src.db.crud import (
     load_all_portfolio_snapshots,
     load_cash_ledger,
     load_position_state,
+    load_reconciliation_events,
     load_trade_receipts,
 )
 from src.db.session import session_scope
@@ -449,36 +450,40 @@ def _compute_team_turnover(history_df: pd.DataFrame, snapshots_df: pd.DataFrame,
         if previous_df.empty or current_df.empty:
             continue
 
-        previous_keys = set(map(tuple, previous_df[key_cols].itertuples(index=False, name=None)))
-        current_keys = set(map(tuple, current_df[key_cols].itertuples(index=False, name=None)))
-        removed_keys = previous_keys - current_keys
-        added_keys = current_keys - previous_keys
-        if not removed_keys and not added_keys:
+        merged = previous_df[key_cols + [COL_SHARES]].merge(
+            current_df[key_cols + [COL_SHARES]],
+            on=key_cols,
+            how="outer",
+            suffixes=("_prev", "_cur"),
+        )
+        merged["shares_prev"] = pd.to_numeric(merged["shares_prev"], errors="coerce").fillna(0.0)
+        merged["shares_cur"] = pd.to_numeric(merged["shares_cur"], errors="coerce").fillna(0.0)
+        merged["delta_shares"] = merged["shares_cur"] - merged["shares_prev"]
+        merged = merged.loc[merged["delta_shares"].abs() > 1e-9].copy()
+        if merged.empty:
             continue
 
-        removed_df = previous_df.loc[previous_df[key_cols].apply(tuple, axis=1).isin(removed_keys)].copy()
-        added_df = current_df.loc[current_df[key_cols].apply(tuple, axis=1).isin(added_keys)].copy()
-
-        removed_value = 0.0
-        added_value = 0.0
-
-        if previous_date in price_matrix.index:
-            row = price_matrix.loc[previous_date]
-            for _, pos in removed_df.iterrows():
-                px = row.get(str(pos[COL_TICKER]).strip().upper())
-                if pd.notna(px):
-                    shares = float(pd.to_numeric(pd.Series([pos[COL_SHARES]]), errors="coerce").fillna(0.0).iloc[0])
-                    removed_value += abs(shares * float(px))
-
+        valuation_row = None
         if current_date in price_matrix.index:
-            row = price_matrix.loc[current_date]
-            for _, pos in added_df.iterrows():
-                px = row.get(str(pos[COL_TICKER]).strip().upper())
-                if pd.notna(px):
-                    shares = float(pd.to_numeric(pd.Series([pos[COL_SHARES]]), errors="coerce").fillna(0.0).iloc[0])
-                    added_value += abs(shares * float(px))
+            valuation_row = price_matrix.loc[current_date]
+        elif previous_date in price_matrix.index:
+            valuation_row = price_matrix.loc[previous_date]
+        if valuation_row is None:
+            continue
 
-        replaced_value += min(removed_value, added_value)
+        buy_value = 0.0
+        sell_value = 0.0
+        for _, pos in merged.iterrows():
+            px = valuation_row.get(str(pos[COL_TICKER]).strip().upper())
+            if pd.isna(px):
+                continue
+            delta_value = float(pos["delta_shares"]) * float(px)
+            if delta_value > 0:
+                buy_value += delta_value
+            elif delta_value < 0:
+                sell_value += abs(delta_value)
+
+        replaced_value += min(buy_value, sell_value)
 
     return (replaced_value / average_aum) * 100.0
 
@@ -570,6 +575,7 @@ def _build_team_history(team: str, snapshots_df: pd.DataFrame) -> pd.DataFrame:
     with session_scope() as session:
         trades_df = load_trade_receipts(session, team=team)
         cash_df = load_cash_ledger(session, team=team)
+        reconciliation_df = load_reconciliation_events(session, team=team)
 
     df = snapshots_df.copy()
     df["snapshot_date"] = pd.to_datetime(df["snapshot_date"], errors="coerce")
@@ -614,6 +620,25 @@ def _build_team_history(team: str, snapshots_df: pd.DataFrame) -> pd.DataFrame:
             if not external_cash.empty:
                 external_cash["flow_date"] = business_dates.take(aligned_idx[valid_mask]).normalize()
 
+    reconciliation_cash = reconciliation_df.copy()
+    if not reconciliation_cash.empty:
+        reconciliation_cash["effective_date"] = pd.to_datetime(
+            reconciliation_cash["effective_date"],
+            errors="coerce",
+        )
+        reconciliation_cash["estimated_cash_impact"] = pd.to_numeric(
+            reconciliation_cash["estimated_cash_impact"],
+            errors="coerce",
+        ).fillna(0.0)
+        reconciliation_cash = reconciliation_cash.dropna(subset=["effective_date"]).copy()
+        if not reconciliation_cash.empty:
+            reconciliation_cash["flow_date"] = reconciliation_cash["effective_date"].dt.normalize()
+            reconciliation_cash = (
+                reconciliation_cash.groupby("flow_date", as_index=False)["estimated_cash_impact"]
+                .sum()
+                .rename(columns={"estimated_cash_impact": "reconciliation_flow"})
+            )
+
     investable_tickers = (
         df[COL_TICKER]
         .loc[~_cash_like_mask(df)]
@@ -640,6 +665,10 @@ def _build_team_history(team: str, snapshots_df: pd.DataFrame) -> pd.DataFrame:
         dt.normalize(): grp.copy()
         for dt, grp in external_cash.groupby("flow_date")
     } if not external_cash.empty else {}
+    reconciliation_flow_by_date = (
+        reconciliation_cash.set_index("flow_date")["reconciliation_flow"].to_dict()
+        if not reconciliation_cash.empty else {}
+    )
     rows = []
     active_positions_df: pd.DataFrame | None = None
 
@@ -671,12 +700,17 @@ def _build_team_history(team: str, snapshots_df: pd.DataFrame) -> pd.DataFrame:
         if active_positions_df is None:
             continue
 
+        # Reconciliation rows represent missing-history portfolio changes, not market
+        # performance, so offset them through the flow series before computing returns.
+        reconciliation_flow = -float(reconciliation_flow_by_date.get(dt.normalize(), 0.0))
+        total_external_flow = net_external_flow + reconciliation_flow
+
         team_aum = _compute_position_value(active_positions_df, price_map)
         rows.append(
             {
                 "date": dt,
                 "team_aum": float(team_aum),
-                "net_external_flow": net_external_flow,
+                "net_external_flow": total_external_flow,
                 "reconciliation_pnl": reconciliation_pnl,
             }
         )
@@ -946,21 +980,67 @@ def render_team_history(history_df: pd.DataFrame, team: str) -> None:
         st.info("No historical pod return data available.")
         return
 
-    team_series = pd.to_numeric(plot_df["team_aum"], errors="coerce")
-    valid_team = team_series.dropna()
-    if valid_team.empty or float(valid_team.iloc[0]) == 0:
+    team_history = _prepare_team_performance_history(plot_df)
+    team_returns = pd.to_numeric(team_history["performance_return"], errors="coerce")
+    if team_returns.dropna().empty:
         st.info("No historical pod return data available.")
         return
-    plot_df["team_return"] = team_series / float(valid_team.iloc[0]) - 1.0
+    plot_df["team_return"] = (1.0 + team_returns.fillna(0.0)).cumprod() - 1.0
     benchmark_spec = get_team_benchmark_spec(team)
 
+    def _rebase_visible_series(series: pd.Series) -> pd.Series:
+        numeric = pd.to_numeric(series, errors="coerce")
+        valid = numeric.dropna()
+        if valid.empty:
+            return numeric
+        start_level = float(valid.iloc[0])
+        rebased = ((1.0 + numeric) / (1.0 + start_level)) - 1.0
+        return pd.to_numeric(rebased, errors="coerce")
+
+    plot_df["team_return"] = _rebase_visible_series(plot_df["team_return"])
+
     has_benchmark = False
-    if "benchmark_aum" in plot_df.columns:
-        benchmark_series = pd.to_numeric(plot_df["benchmark_aum"], errors="coerce")
-        valid_benchmark = benchmark_series.dropna()
-        if not valid_benchmark.empty and float(valid_benchmark.iloc[0]) != 0:
-            plot_df["benchmark_return"] = benchmark_series / float(valid_benchmark.iloc[0]) - 1.0
-            has_benchmark = True
+    benchmark_returns = pd.Series(dtype="float64")
+    if "benchmark_return_index" in plot_df.columns:
+        benchmark_returns = pd.to_numeric(plot_df["benchmark_return_index"], errors="coerce")
+
+    if benchmark_returns.dropna().empty:
+        component_series = []
+        for component in benchmark_spec.get("components", []):
+            ticker = str(component.get("ticker", "")).strip().upper()
+            component_column = f"benchmark_component_{ticker}_return_index"
+            if component_column not in plot_df.columns:
+                continue
+            component_returns = pd.to_numeric(plot_df[component_column], errors="coerce")
+            if component_returns.dropna().empty:
+                continue
+            component_series.append(
+                pd.DataFrame(
+                    {
+                        "ticker": ticker,
+                        "weight": float(component.get("weight", 0.0)),
+                        "return_index": component_returns,
+                    }
+                )
+            )
+        if component_series:
+            # Fallback aggregate benchmark from component cumulative return lines.
+            # This is not the preferred path, but it preserves a usable benchmark
+            # series if the prebuilt aggregate column is missing.
+            benchmark_daily = pd.Series(0.0, index=plot_df.index, dtype="float64")
+            total_weight = 0.0
+            for component_df in component_series:
+                weight = float(component_df["weight"].iloc[0])
+                component_index = pd.to_numeric(component_df["return_index"], errors="coerce")
+                component_daily = (1.0 + component_index.fillna(0.0)).pct_change().fillna(component_index.fillna(0.0))
+                benchmark_daily = benchmark_daily.add(component_daily * weight, fill_value=0.0)
+                total_weight += weight
+            if total_weight > 0:
+                benchmark_returns = (1.0 + (benchmark_daily / total_weight)).cumprod() - 1.0
+
+    if not benchmark_returns.dropna().empty:
+        plot_df["benchmark_return"] = _rebase_visible_series(benchmark_returns).to_numpy()
+        has_benchmark = True
 
     fig = go.Figure()
     fig.add_trace(
@@ -984,14 +1064,13 @@ def render_team_history(history_df: pd.DataFrame, team: str) -> None:
         if len(benchmark_components) > 1:
             for component in benchmark_components:
                 ticker = str(component.get("ticker", "")).strip().upper()
-                component_column = f"benchmark_component_{ticker}_aum"
+                component_column = f"benchmark_component_{ticker}_return_index"
                 if component_column not in plot_df.columns:
                     continue
-                component_series = pd.to_numeric(plot_df[component_column], errors="coerce")
-                valid_component = component_series.dropna()
-                if valid_component.empty or float(valid_component.iloc[0]) == 0:
+                component_returns = pd.to_numeric(plot_df[component_column], errors="coerce")
+                if component_returns.dropna().empty:
                     continue
-                plot_df[f"{ticker}_return"] = component_series / float(valid_component.iloc[0]) - 1.0
+                plot_df[f"{ticker}_return"] = _rebase_visible_series(component_returns).to_numpy()
                 fig.add_trace(
                     go.Scatter(
                         x=plot_df["date"],
@@ -1009,6 +1088,7 @@ def render_team_history(history_df: pd.DataFrame, team: str) -> None:
         yaxis_title="Cumulative Return",
         legend=dict(title=None),
         margin=dict(t=58),
+        showlegend=True,
     )
     fig.update_yaxes(tickformat=".1%")
     st.plotly_chart(fig, use_container_width=True)

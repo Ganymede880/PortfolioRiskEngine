@@ -40,9 +40,11 @@ from src.data.normalizers import (
 from src.data.validators import validate_uploaded_dataframe
 from src.db.crud import (
     get_latest_position_state_before_or_on,
+    load_all_portfolio_snapshots,
     load_cash_ledger,
     load_position_state,
     load_trade_receipts,
+    load_upload_logs,
     log_upload_event,
     replace_position_state_for_date,
     save_cash_ledger_entries,
@@ -50,7 +52,7 @@ from src.db.crud import (
     save_reconciliation_events,
     save_trade_receipts,
 )
-from src.db.models import CashLedger, ReconciliationEvent
+from src.db.models import CashLedger, PortfolioSnapshot, PositionState, ReconciliationEvent, TradeReceipt, UploadLog
 from src.db.session import session_scope
 from src.data.price_fetcher import fetch_multiple_price_histories
 from src.analytics.ledger import (
@@ -60,10 +62,10 @@ from src.analytics.ledger import (
     derive_trade_cash_amount,
     reconcile_expected_positions_to_authoritative_snapshot,
 )
-from src.db import crud
 from src.utils.ui import apply_app_theme, left_align_dataframe, render_top_nav
 
 EXPLICIT_SNAPSHOT_FLOW_TYPES = {"SECTOR_REBALANCE", "PORTFOLIO_LIQUIDATION"}
+UPLOAD_MANAGED_CASH_ACTIVITY_TYPES = {"RECONCILIATION", "SECTOR_REBALANCE", "PORTFOLIO_LIQUIDATION"}
 
 
 def _apply_upload_control_theme() -> None:
@@ -507,39 +509,371 @@ def _render_reconciliation_preview(
         )
 
 
-def _render_clear_uploads_action() -> None:
-    with st.container(border=True):
-        action_col, confirm_col = st.columns([1, 1.4])
-        with action_col:
-            if st.button(
-                "Clear All Uploads",
-                type="primary",
-                use_container_width=True,
-            ):
-                if not st.session_state.get("confirm_clear_all_uploads", False):
-                    st.warning("Check the confirmation box before clearing all uploaded portfolio data.")
-                else:
-                    with session_scope() as session:
-                        counts = crud.clear_all_uploaded_portfolio_data(session)
-                    st.session_state["confirm_clear_all_uploads"] = False
-                    st.session_state["last_clear_all_uploads_counts"] = counts
-                    st.rerun()
-        with confirm_col:
-            st.checkbox(
-                "I understand this will delete all uploaded files.",
-                key="confirm_clear_all_uploads",
-            )
+def _seed_position_state_from_snapshot(
+    session,
+    snapshot_df: pd.DataFrame,
+    snapshot_ts: pd.Timestamp,
+    reconciliation_df: pd.DataFrame | None = None,
+) -> int:
+    position_state_seed_df = snapshot_df.copy()
+    position_state_seed_df["as_of_date"] = snapshot_ts.date()
+    position_state_seed_df["is_reconciled"] = False
 
-    if "last_clear_all_uploads_counts" in st.session_state:
-        counts = st.session_state.pop("last_clear_all_uploads_counts")
+    if reconciliation_df is not None and not reconciliation_df.empty:
+        reconciliation_keys = set(
+            zip(
+                reconciliation_df["team"],
+                reconciliation_df["ticker"],
+                reconciliation_df["position_side"],
+            )
+        )
+        position_state_seed_df["is_reconciled"] = list(
+            zip(
+                position_state_seed_df["team"],
+                position_state_seed_df["ticker"],
+                position_state_seed_df["position_side"],
+            )
+        )
+        position_state_seed_df["is_reconciled"] = position_state_seed_df["is_reconciled"].isin(reconciliation_keys)
+
+    return replace_position_state_for_date(
+        session=session,
+        as_of_date=snapshot_ts.date(),
+        position_state_df=position_state_seed_df,
+    )
+
+
+def _rebuild_snapshot_state_for_date(
+    session,
+    snapshot_df: pd.DataFrame,
+    snapshot_ts: pd.Timestamp,
+) -> dict[str, int]:
+    snapshot_date = snapshot_ts.date()
+    prior_state_cutoff = (snapshot_ts.normalize() - pd.Timedelta(days=1)).date()
+    latest_state_date = get_latest_position_state_before_or_on(session, prior_state_cutoff)
+
+    if latest_state_date is None:
+        seeded_rows = _seed_position_state_from_snapshot(
+            session=session,
+            snapshot_df=snapshot_df,
+            snapshot_ts=snapshot_ts,
+        )
+        return {
+            "position_state_rows": seeded_rows,
+            "reconciliation_rows": 0,
+        }
+
+    expected_positions_df, _, between_cash_df = _build_expected_positions_for_snapshot(
+        session=session,
+        snapshot_ts=snapshot_ts,
+    )
+    assumed_price_map = _build_assumed_price_map(
+        snapshot_df=snapshot_df,
+        expected_positions_df=expected_positions_df,
+        snapshot_ts=snapshot_ts,
+    )
+    _ = _build_sector_discontinuity_warnings(
+        expected_positions_df=expected_positions_df,
+        snapshot_df=snapshot_df,
+        between_cash_df=between_cash_df,
+        assumed_price_map=assumed_price_map,
+    )
+    _, reconciliation_df, _ = reconcile_expected_positions_to_authoritative_snapshot(
+        expected_positions_df=expected_positions_df,
+        authoritative_snapshot_df=snapshot_df,
+        snapshot_date=snapshot_ts,
+        effective_date=snapshot_ts.normalize(),
+        assumed_price_map=assumed_price_map,
+        config=ReconciliationConfig(default_assumed_price=None),
+    )
+
+    _delete_reconciliation_artifacts_for_snapshot(
+        session=session,
+        snapshot_date=snapshot_date,
+        effective_date=snapshot_date,
+    )
+    reconciliation_rows = (
+        save_reconciliation_events(session, reconciliation_df)
+        if not reconciliation_df.empty else 0
+    )
+    seeded_rows = _seed_position_state_from_snapshot(
+        session=session,
+        snapshot_df=snapshot_df,
+        snapshot_ts=snapshot_ts,
+        reconciliation_df=reconciliation_df,
+    )
+    return {
+        "position_state_rows": seeded_rows,
+        "reconciliation_rows": reconciliation_rows,
+    }
+
+
+def _rebuild_external_flow_entries_from_surviving_trades(
+    session,
+    upload_logs_df: pd.DataFrame,
+) -> int:
+    trades_df = load_trade_receipts(session=session)
+    if trades_df.empty or upload_logs_df.empty:
+        return 0
+
+    logs = upload_logs_df.copy()
+    logs["source_file"] = logs["source_file"].astype(str).str.strip()
+    logs["upload_type"] = logs["upload_type"].astype(str).str.strip().str.lower()
+    logs["status"] = logs["status"].astype(str).str.strip().str.lower()
+    logs["upload_timestamp"] = pd.to_datetime(logs["upload_timestamp"], errors="coerce")
+    logs = logs.sort_values("upload_timestamp", kind="stable")
+
+    latest_success = (
+        logs.loc[logs["status"].eq("success")]
+        .drop_duplicates(subset=["source_file"], keep="last")
+        .set_index("source_file")
+    )
+
+    flow_rows = 0
+    for source_file, trade_group in trades_df.groupby("source_file", dropna=False, sort=False):
+        source_key = str(source_file).strip()
+        if not source_key or source_key not in latest_success.index:
+            continue
+
+        upload_type = str(latest_success.at[source_key, "upload_type"]).strip().lower()
+        external_flow_df = _build_external_flow_entries_for_trade_upload(
+            trades_df=trade_group,
+            upload_type=upload_type,
+        )
+        if external_flow_df.empty:
+            continue
+
+        flow_rows += save_cash_ledger_entries(
+            session=session,
+            cash_df=external_flow_df,
+        )
+
+    return flow_rows
+
+
+def _rebuild_portfolio_state_from_existing_uploads(session) -> dict[str, int]:
+    session.execute(
+        delete(CashLedger).where(CashLedger.activity_type.in_(UPLOAD_MANAGED_CASH_ACTIVITY_TYPES))
+    )
+    session.execute(delete(ReconciliationEvent))
+    session.execute(delete(PositionState))
+    session.flush()
+
+    upload_logs_df = load_upload_logs(session=session, limit=10000)
+    regenerated_flow_rows = _rebuild_external_flow_entries_from_surviving_trades(
+        session=session,
+        upload_logs_df=upload_logs_df,
+    )
+
+    snapshots_df = load_all_portfolio_snapshots(session=session)
+    position_state_rows = 0
+    reconciliation_rows = 0
+    rebuilt_snapshots = 0
+
+    if not snapshots_df.empty:
+        snapshots_df["snapshot_date"] = pd.to_datetime(snapshots_df["snapshot_date"], errors="coerce")
+        snapshots_df["created_at"] = pd.to_datetime(snapshots_df.get("created_at"), errors="coerce")
+        snapshots_df = snapshots_df.dropna(subset=["snapshot_date"]).copy()
+
+        grouped = snapshots_df.sort_values(
+            ["snapshot_date", "created_at", "team", "ticker", "position_side"],
+            kind="stable",
+        ).groupby("snapshot_date", sort=False)
+
+        for snapshot_ts, snapshot_group in grouped:
+            counts = _rebuild_snapshot_state_for_date(
+                session=session,
+                snapshot_df=snapshot_group.copy(),
+                snapshot_ts=pd.Timestamp(snapshot_ts),
+            )
+            rebuilt_snapshots += 1
+            position_state_rows += counts.get("position_state_rows", 0)
+            reconciliation_rows += counts.get("reconciliation_rows", 0)
+
+    return {
+        "external_flow_rows": regenerated_flow_rows,
+        "reconciliation_rows": reconciliation_rows,
+        "position_state_rows": position_state_rows,
+        "snapshots_rebuilt": rebuilt_snapshots,
+    }
+
+
+def _build_uploaded_files_table(session) -> pd.DataFrame:
+    snapshots_df = load_all_portfolio_snapshots(session=session)
+    trades_df = load_trade_receipts(session=session)
+    upload_logs_df = load_upload_logs(session=session, limit=10000)
+
+    file_rows: list[dict[str, object]] = []
+    source_files = {
+        str(source_file).strip()
+        for source_file in pd.concat(
+            [
+                snapshots_df.get("source_file", pd.Series(dtype="object")),
+                trades_df.get("source_file", pd.Series(dtype="object")),
+            ],
+            ignore_index=True,
+        ).dropna().tolist()
+        if str(source_file).strip()
+    }
+
+    if not source_files:
+        return pd.DataFrame(
+            columns=[
+                "source_file",
+                "upload_type",
+                "selected_sheet",
+                "uploaded_at",
+                "snapshot_rows",
+                "trade_rows",
+                "current_rows",
+                "status",
+            ]
+        )
+
+    logs = upload_logs_df.copy()
+    if not logs.empty:
+        logs["upload_timestamp"] = pd.to_datetime(logs["upload_timestamp"], errors="coerce")
+        logs = logs.sort_values("upload_timestamp", kind="stable")
+
+    for source_file in sorted(source_files):
+        snapshot_rows = int(
+            snapshots_df.get("source_file", pd.Series(dtype="object")).astype(str).str.strip().eq(source_file).sum()
+        ) if not snapshots_df.empty else 0
+        trade_rows = int(
+            trades_df.get("source_file", pd.Series(dtype="object")).astype(str).str.strip().eq(source_file).sum()
+        ) if not trades_df.empty else 0
+
+        file_logs = logs.loc[logs["source_file"].astype(str).str.strip().eq(source_file)].copy() if not logs.empty else pd.DataFrame()
+        latest_success = file_logs.loc[file_logs["status"].astype(str).str.lower().eq("success")].tail(1)
+        chosen_log = latest_success if not latest_success.empty else file_logs.tail(1)
+
+        upload_type = chosen_log["upload_type"].iloc[0] if not chosen_log.empty else ""
+        selected_sheet = chosen_log["selected_sheet"].iloc[0] if not chosen_log.empty else ""
+        uploaded_at = chosen_log["upload_timestamp"].iloc[0] if not chosen_log.empty else pd.NaT
+        status = chosen_log["status"].iloc[0] if not chosen_log.empty else ""
+
+        file_rows.append(
+            {
+                "source_file": source_file,
+                "upload_type": str(upload_type).replace("_", " ").title() if upload_type else "",
+                "selected_sheet": selected_sheet or "CSV",
+                "uploaded_at": uploaded_at,
+                "snapshot_rows": snapshot_rows,
+                "trade_rows": trade_rows,
+                "current_rows": snapshot_rows + trade_rows,
+                "status": status,
+            }
+        )
+
+    inventory_df = pd.DataFrame(file_rows)
+    if inventory_df.empty:
+        return inventory_df
+
+    return inventory_df.sort_values(["uploaded_at", "source_file"], ascending=[False, True], kind="stable").reset_index(drop=True)
+
+
+def _delete_uploaded_file_and_rebuild(
+    session,
+    source_file: str,
+) -> dict[str, int]:
+    source_key = str(source_file).strip()
+    deleted_snapshot_rows = int(
+        session.execute(
+            delete(PortfolioSnapshot).where(PortfolioSnapshot.source_file == source_key)
+        ).rowcount or 0
+    )
+    deleted_trade_rows = int(
+        session.execute(
+            delete(TradeReceipt).where(TradeReceipt.source_file == source_key)
+        ).rowcount or 0
+    )
+    deleted_upload_logs = int(
+        session.execute(
+            delete(UploadLog).where(UploadLog.source_file == source_key)
+        ).rowcount or 0
+    )
+    session.flush()
+
+    rebuild_counts = _rebuild_portfolio_state_from_existing_uploads(session)
+    rebuild_counts.update(
+        {
+            "deleted_snapshot_rows": deleted_snapshot_rows,
+            "deleted_trade_rows": deleted_trade_rows,
+            "deleted_upload_logs": deleted_upload_logs,
+        }
+    )
+    return rebuild_counts
+
+
+def _render_uploaded_files_section() -> None:
+    st.subheader("Uploaded Files")
+    with session_scope() as session:
+        uploaded_files_df = _build_uploaded_files_table(session)
+
+    if uploaded_files_df.empty:
+        st.info("No uploaded files are currently stored.")
+        return
+
+    display_df = uploaded_files_df.rename(
+        columns={
+            "source_file": "Source File",
+            "upload_type": "Upload Type",
+            "selected_sheet": "Sheet",
+            "uploaded_at": "Uploaded At",
+            "snapshot_rows": "Snapshot Rows",
+            "trade_rows": "Trade Rows",
+            "current_rows": "Current Rows",
+            "status": "Status",
+        }
+    ).copy()
+    st.dataframe(
+        left_align_dataframe(display_df),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    source_options = uploaded_files_df["source_file"].tolist()
+    confirm_key = "confirm_delete_uploaded_file"
+    if st.session_state.pop("reset_confirm_delete_uploaded_file", False):
+        st.session_state.pop(confirm_key, None)
+
+    with st.container(border=True):
+        selected_source_file = st.selectbox(
+            "Select an uploaded file to delete",
+            options=source_options,
+            format_func=lambda value: value,
+        )
+        st.checkbox(
+            "I understand this will rebuild portfolio history as if the selected file was never uploaded.",
+            key=confirm_key,
+        )
+        if st.button("Delete Selected File", type="primary", use_container_width=True):
+            if not st.session_state.get(confirm_key, False):
+                st.warning("Check the confirmation box before deleting an uploaded file.")
+            else:
+                with session_scope() as session:
+                    counts = _delete_uploaded_file_and_rebuild(
+                        session=session,
+                        source_file=selected_source_file,
+                    )
+                st.session_state["reset_confirm_delete_uploaded_file"] = True
+                st.session_state["last_deleted_uploaded_file"] = {
+                    "source_file": selected_source_file,
+                    **counts,
+                }
+                st.rerun()
+
+    if "last_deleted_uploaded_file" in st.session_state:
+        result = st.session_state.pop("last_deleted_uploaded_file")
         st.success(
-            "Cleared uploaded portfolio data: "
-            f"{counts.get('portfolio_snapshots', 0)} snapshot rows, "
-            f"{counts.get('trade_receipts', 0)} trade rows, "
-            f"{counts.get('cash_ledger', 0)} cash ledger rows, "
-            f"{counts.get('reconciliation_events', 0)} reconciliation rows, "
-            f"{counts.get('position_state', 0)} position-state rows, and "
-            f"{counts.get('upload_logs', 0)} upload log rows."
+            f"Deleted {result['source_file']}: "
+            f"{result.get('deleted_snapshot_rows', 0)} snapshot rows, "
+            f"{result.get('deleted_trade_rows', 0)} trade rows, and "
+            f"{result.get('deleted_upload_logs', 0)} upload log rows removed. "
+            f"Rebuilt {result.get('snapshots_rebuilt', 0)} snapshot checkpoint(s), "
+            f"{result.get('position_state_rows', 0)} position-state rows, "
+            f"{result.get('reconciliation_rows', 0)} reconciliation rows, and "
+            f"{result.get('external_flow_rows', 0)} external cash-flow rows from remaining files."
         )
 
 
@@ -960,7 +1294,7 @@ def main() -> None:
                     pass
 
     st.divider()
-    _render_clear_uploads_action()
+    _render_uploaded_files_section()
 
 
 if __name__ == "__main__":

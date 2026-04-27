@@ -12,6 +12,7 @@ import copy
 from dataclasses import dataclass, field
 from functools import lru_cache
 import hashlib
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +37,12 @@ from src.analytics.performance import (
     prepare_flow_adjusted_history,
 )
 from src.data.price_fetcher import _yfinance_request_context, fetch_multiple_price_histories
-from src.db.crud import load_all_portfolio_snapshots, load_cash_ledger, load_trade_receipts
+from src.db.crud import (
+    get_portfolio_history_cache_signature,
+    load_all_portfolio_snapshots,
+    load_cash_ledger,
+    load_trade_receipts,
+)
 from src.db.session import session_scope
 from src.config.settings import settings
 
@@ -56,7 +62,11 @@ FACTOR_MODEL_DISPLAY_LOOKBACK_DAYS = 365
 FACTOR_MODEL_WARMUP_DAYS = 425
 FACTOR_MODEL_PRICE_LOOKBACK_DAYS = FACTOR_MODEL_DISPLAY_LOOKBACK_DAYS + FACTOR_MODEL_WARMUP_DAYS
 MAX_FACTOR_ANALYTICS_CACHE_ENTRIES = 4
+FACTOR_REFERENCE_CACHE_TTL_SECONDS = 24 * 60 * 60
+FACTOR_ARTIFACT_CACHE_TTL_SECONDS = 24 * 60 * 60
+PORTFOLIO_HISTORY_CACHE_TTL_SECONDS = 12 * 60 * 60
 _FACTOR_ANALYTICS_CACHE: dict[str, dict[str, Any]] = {}
+_PORTFOLIO_HISTORY_CACHE: dict[str, pd.DataFrame] = {}
 
 
 @dataclass(frozen=True)
@@ -164,6 +174,11 @@ def _cache_path_for_named_frame(name: str) -> Path:
     return settings.cache_dir / f"{safe_name}.csv"
 
 
+def _cache_path_for_named_blob(name: str) -> Path:
+    safe_name = str(name).strip().replace("/", "-").replace("\\", "-").replace(":", "-")
+    return settings.cache_dir / f"{safe_name}.pkl"
+
+
 def _read_frame_cache(cache_path: Path) -> pd.DataFrame:
     try:
         if cache_path.exists():
@@ -230,6 +245,84 @@ def _store_factor_analytics_cache(cache_key: str, analytics: dict[str, Any]) -> 
         _FACTOR_ANALYTICS_CACHE.pop(oldest_key, None)
     _FACTOR_ANALYTICS_CACHE[cache_key] = _copy_cached_analytics_payload(analytics)
     return _copy_cached_analytics_payload(analytics)
+
+
+def _persist_factor_analytics_cache(cache_key: str, analytics: dict[str, Any]) -> None:
+    cache_path = _cache_path_for_named_blob(
+        f"factor_analytics_{hashlib.sha1(cache_key.encode('utf-8')).hexdigest()}"
+    )
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with cache_path.open("wb") as fh:
+            pickle.dump(analytics, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
+
+
+def _load_persisted_factor_analytics_cache(cache_key: str) -> dict[str, Any] | None:
+    cache_path = _cache_path_for_named_blob(
+        f"factor_analytics_{hashlib.sha1(cache_key.encode('utf-8')).hexdigest()}"
+    )
+    if not _is_cache_fresh(cache_path, FACTOR_ARTIFACT_CACHE_TTL_SECONDS):
+        return None
+    try:
+        with cache_path.open("rb") as fh:
+            payload = pickle.load(fh)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        _validate_analytics_payload(payload)
+    except Exception:
+        return None
+    return _copy_cached_analytics_payload(payload)
+
+
+def _finalize_factor_analytics_cache(cache_key: str, analytics: dict[str, Any]) -> dict[str, Any]:
+    stored = _store_factor_analytics_cache(cache_key, analytics)
+    _persist_factor_analytics_cache(cache_key, stored)
+    return stored
+
+
+def _build_portfolio_history_cache_key(lookback_days: int, signature: dict[str, object]) -> str:
+    signature_hash = hashlib.sha1(repr(sorted(signature.items())).encode("utf-8")).hexdigest()
+    return f"portfolio_history:{lookback_days}:{signature_hash}"
+
+
+def _persist_portfolio_history_cache(cache_key: str, history_df: pd.DataFrame) -> None:
+    cache_path = _cache_path_for_named_blob(
+        f"portfolio_history_{hashlib.sha1(cache_key.encode('utf-8')).hexdigest()}"
+    )
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with cache_path.open("wb") as fh:
+            pickle.dump(history_df, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
+
+
+def _load_persisted_portfolio_history_cache(cache_key: str) -> pd.DataFrame | None:
+    cache_path = _cache_path_for_named_blob(
+        f"portfolio_history_{hashlib.sha1(cache_key.encode('utf-8')).hexdigest()}"
+    )
+    if not _is_cache_fresh(cache_path, PORTFOLIO_HISTORY_CACHE_TTL_SECONDS):
+        return None
+    try:
+        with cache_path.open("rb") as fh:
+            payload = pickle.load(fh)
+    except Exception:
+        return None
+    if not isinstance(payload, pd.DataFrame):
+        return None
+    return payload.copy()
+
+
+def _finalize_portfolio_history_cache(cache_key: str, history_df: pd.DataFrame) -> pd.DataFrame:
+    cached_df = history_df.copy()
+    _PORTFOLIO_HISTORY_CACHE[cache_key] = cached_df
+    _persist_portfolio_history_cache(cache_key, cached_df)
+    return cached_df.copy()
 
 
 def _reason_or_default(df: pd.DataFrame, reason: str) -> str:
@@ -388,6 +481,10 @@ def _get_sp500_constituents_cached() -> pd.DataFrame:
         working = working.loc[working["ticker"].ne("")].drop_duplicates(subset=["ticker"]).reset_index(drop=True)
         return working[required]
 
+    cached = _read_frame_cache(cache_path)
+    if not cached.empty:
+        return _finalize(cached)
+
     csv_sources = [
         "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv",
         "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
@@ -411,9 +508,6 @@ def _get_sp500_constituents_cached() -> pd.DataFrame:
     except Exception:
         pass
 
-    cached = _read_frame_cache(cache_path)
-    if not cached.empty:
-        return _finalize(cached)
     return pd.DataFrame(columns=required)
 
 
@@ -424,7 +518,7 @@ def get_sp500_constituents() -> pd.DataFrame:
 def _fetch_yahoo_fundamentals_rows(tickers: tuple[str, ...]) -> pd.DataFrame:
     ticker_key = hashlib.sha1("|".join(tickers).encode("utf-8")).hexdigest()
     cache_path = _cache_path_for_named_frame(f"fundamentals_{ticker_key}")
-    if _is_cache_fresh(cache_path, settings.price_refresh_interval_seconds):
+    if _is_cache_fresh(cache_path, FACTOR_REFERENCE_CACHE_TTL_SECONDS):
         cached = _read_frame_cache(cache_path)
         if not cached.empty:
             return cached
@@ -828,14 +922,31 @@ def _compute_period_returns(
     return output.sort_values("date").reset_index(drop=True), decile_returns_df.sort_values(["date", "factor", "decile"]).reset_index(drop=True)
 
 
-def build_portfolio_return_history(lookback_days: int = 450) -> pd.DataFrame:
+def build_portfolio_return_history(
+    lookback_days: int = 450,
+    base_price_history_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     with session_scope() as session:
+        cache_signature = get_portfolio_history_cache_signature(session)
+        cache_key = _build_portfolio_history_cache_key(lookback_days, cache_signature)
+        in_memory_cached = _PORTFOLIO_HISTORY_CACHE.get(cache_key)
+        if in_memory_cached is not None:
+            return in_memory_cached.copy()
+
+        persisted_cached = _load_persisted_portfolio_history_cache(cache_key)
+        if persisted_cached is not None:
+            _PORTFOLIO_HISTORY_CACHE[cache_key] = persisted_cached.copy()
+            return persisted_cached
+
         snapshots_df = load_all_portfolio_snapshots(session)
         trades_df = load_trade_receipts(session)
         cash_df = load_cash_ledger(session)
 
     if snapshots_df.empty:
-        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "reconciliation_pnl", "portfolio_return", "portfolio_pnl"])
+        return _finalize_portfolio_history_cache(
+            cache_key,
+            pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "reconciliation_pnl", "portfolio_return", "portfolio_pnl"]),
+        )
 
     snapshots = snapshots_df.copy()
     snapshots["snapshot_date"] = pd.to_datetime(snapshots["snapshot_date"], errors="coerce")
@@ -846,14 +957,20 @@ def build_portfolio_return_history(lookback_days: int = 450) -> pd.DataFrame:
     _validate_snapshot_history_integrity(snapshots)
     snapshots = snapshots.dropna(subset=["snapshot_date", COL_TICKER, COL_SHARES]).copy()
     if snapshots.empty:
-        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "reconciliation_pnl", "portfolio_return", "portfolio_pnl"])
+        return _finalize_portfolio_history_cache(
+            cache_key,
+            pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "reconciliation_pnl", "portfolio_return", "portfolio_pnl"]),
+        )
 
     today = pd.Timestamp.today().normalize()
     oldest_snapshot_date = snapshots["snapshot_date"].min().normalize()
     start_date = max(oldest_snapshot_date, today - pd.Timedelta(days=lookback_days))
     business_dates = pd.bdate_range(start=start_date, end=today)
     if len(business_dates) == 0:
-        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "reconciliation_pnl", "portfolio_return", "portfolio_pnl"])
+        return _finalize_portfolio_history_cache(
+            cache_key,
+            pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow", "reconciliation_pnl", "portfolio_return", "portfolio_pnl"]),
+        )
 
     trades = trades_df.copy()
     if not trades.empty:
@@ -882,7 +999,25 @@ def build_portfolio_return_history(lookback_days: int = 450) -> pd.DataFrame:
             if ticker not in {"CASH", "EUR", "GBP", "NOGXX"}
         }
     )
-    price_history_df = fetch_multiple_price_histories(price_tickers, lookback_days=(today - start_date).days + 30)
+    reused_price_history_df = pd.DataFrame()
+    missing_price_tickers = price_tickers
+    if base_price_history_df is not None and not base_price_history_df.empty:
+        reused_price_history_df = base_price_history_df.copy()
+        reused_price_history_df["ticker"] = reused_price_history_df["ticker"].astype(str).map(_normalize_ticker)
+        available_tickers = set(reused_price_history_df["ticker"].dropna().astype(str).tolist())
+        missing_price_tickers = [ticker for ticker in price_tickers if ticker not in available_tickers]
+
+    fetched_price_history_df = (
+        fetch_multiple_price_histories(
+            missing_price_tickers,
+            lookback_days=(today - start_date).days + 30,
+        )
+        if missing_price_tickers else pd.DataFrame()
+    )
+    price_history_df = pd.concat(
+        [reused_price_history_df, fetched_price_history_df],
+        ignore_index=True,
+    ) if not reused_price_history_df.empty or not fetched_price_history_df.empty else pd.DataFrame()
     price_matrix = _build_price_matrix(price_history_df).reindex(business_dates).ffill()
 
     snapshots_by_date = {dt.normalize(): grp.copy() for dt, grp in snapshots.groupby(snapshots["snapshot_date"].dt.normalize())}
@@ -928,22 +1063,28 @@ def build_portfolio_return_history(lookback_days: int = 450) -> pd.DataFrame:
 
     history_df = pd.DataFrame(rows)
     if history_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "date",
-                "portfolio_aum",
-                "net_external_flow",
-                "reconciliation_pnl",
-                "portfolio_return",
-                "portfolio_pnl",
-            ]
+        return _finalize_portfolio_history_cache(
+            cache_key,
+            pd.DataFrame(
+                columns=[
+                    "date",
+                    "portfolio_aum",
+                    "net_external_flow",
+                    "reconciliation_pnl",
+                    "portfolio_return",
+                    "portfolio_pnl",
+                ]
+            ),
         )
 
     prepared = prepare_flow_adjusted_history(history_df, value_column="portfolio_aum", flow_column="net_external_flow")
     prepared = prepared.rename(columns={"performance_return": "portfolio_return", "performance_pnl": "portfolio_pnl"})
     if "reconciliation_pnl" not in prepared.columns:
         prepared["reconciliation_pnl"] = 0.0
-    return prepared[["date", "portfolio_aum", "net_external_flow", "reconciliation_pnl", "portfolio_return", "portfolio_pnl"]]
+    return _finalize_portfolio_history_cache(
+        cache_key,
+        prepared[["date", "portfolio_aum", "net_external_flow", "reconciliation_pnl", "portfolio_return", "portfolio_pnl"]],
+    )
 
 
 def _build_regression_suite(
@@ -1628,6 +1769,9 @@ def build_factor_analytics_platform(
     cached = _FACTOR_ANALYTICS_CACHE.get(cache_key)
     if cached is not None:
         return _copy_cached_analytics_payload(cached)
+    persisted = _load_persisted_factor_analytics_cache(cache_key)
+    if persisted is not None:
+        return _store_factor_analytics_cache(cache_key, persisted)
     notes = [
         "These are custom live factors built from current Yahoo data and S&P 500 constituents, not official Fama-French factors.",
         "The factor universe uses current S&P 500 constituents, so the system is subject to survivorship bias.",
@@ -1636,7 +1780,7 @@ def build_factor_analytics_platform(
 
     universe_df = get_sp500_constituents()
     if universe_df.empty:
-        return _store_factor_analytics_cache(
+        return _finalize_factor_analytics_cache(
             cache_key,
             _empty_analytics_payload(notes + ["Unable to fetch S&P 500 constituents."]),
         )
@@ -1652,7 +1796,7 @@ def build_factor_analytics_platform(
     if price_matrix.empty or "SPY" not in price_matrix.columns:
         analytics = _empty_analytics_payload(notes + ["Unable to build price history or SPY market history."])
         analytics["universe_fundamentals"] = universe
-        return _store_factor_analytics_cache(cache_key, analytics)
+        return _finalize_factor_analytics_cache(cache_key, analytics)
 
     market_returns = pd.to_numeric(price_matrix["SPY"], errors="coerce").pct_change()
     stock_tickers = [ticker for ticker in price_matrix.columns if ticker != "SPY"]
@@ -1670,6 +1814,7 @@ def build_factor_analytics_platform(
     factor_returns_df, decile_returns_df = _compute_period_returns(weight_book_df, decile_weight_book_df, stock_returns, market_returns)
     portfolio_returns_df = build_portfolio_return_history(
         lookback_days=FACTOR_MODEL_PRICE_LOOKBACK_DAYS,
+        base_price_history_df=price_history_df,
     )
 
     regression_summary_df, rolling_betas_df, multi_horizon_exposures_df, residual_return_series_df, regression_input_df, latest_portfolio_factor_betas_df = _build_regression_suite(
@@ -1687,12 +1832,51 @@ def build_factor_analytics_platform(
     factor_regime_df = _build_factor_regime_df(factor_returns_df)
     drawdowns_df = _build_drawdown_df(factor_returns_df, portfolio_returns_df)
 
-    holdings_tickers = holdings_snapshot_df[COL_TICKER].dropna().astype(str).map(_normalize_ticker).tolist() if not holdings_snapshot_df.empty else []
-    holdings_fundamentals_df = fetch_live_security_fundamentals(holdings_tickers)
-    holdings_price_history_df = fetch_multiple_price_histories(
-        sorted({ticker for ticker in holdings_tickers if str(ticker).strip()}),
-        lookback_days=FACTOR_MODEL_PRICE_LOOKBACK_DAYS,
-    ) if holdings_tickers else pd.DataFrame()
+    holdings_tickers = (
+        holdings_snapshot_df[COL_TICKER].dropna().astype(str).map(_normalize_ticker).tolist()
+        if not holdings_snapshot_df.empty else []
+    )
+    holdings_ticker_set = sorted({ticker for ticker in holdings_tickers if str(ticker).strip()})
+    holdings_fundamentals_df = universe.loc[
+        universe["ticker"].astype(str).isin(holdings_ticker_set)
+    ].copy()
+    missing_holdings_fundamentals = [
+        ticker for ticker in holdings_ticker_set
+        if ticker not in set(holdings_fundamentals_df["ticker"].astype(str).tolist())
+    ]
+    if missing_holdings_fundamentals:
+        extra_holdings_fundamentals_df = fetch_live_security_fundamentals(missing_holdings_fundamentals)
+        holdings_fundamentals_df = pd.concat(
+            [holdings_fundamentals_df, extra_holdings_fundamentals_df],
+            ignore_index=True,
+        )
+        if not holdings_fundamentals_df.empty:
+            holdings_fundamentals_df = holdings_fundamentals_df.drop_duplicates(
+                subset=["ticker"],
+                keep="last",
+            ).reset_index(drop=True)
+
+    holdings_price_history_df = price_history_df.loc[
+        price_history_df["ticker"].astype(str).isin(holdings_ticker_set)
+    ].copy() if not price_history_df.empty else pd.DataFrame()
+    missing_holdings_price_tickers = [
+        ticker for ticker in holdings_ticker_set
+        if ticker not in set(holdings_price_history_df["ticker"].astype(str).tolist())
+    ]
+    if missing_holdings_price_tickers:
+        extra_holdings_price_history_df = fetch_multiple_price_histories(
+            missing_holdings_price_tickers,
+            lookback_days=FACTOR_MODEL_PRICE_LOOKBACK_DAYS,
+        )
+        holdings_price_history_df = pd.concat(
+            [holdings_price_history_df, extra_holdings_price_history_df],
+            ignore_index=True,
+        )
+        if not holdings_price_history_df.empty:
+            holdings_price_history_df = holdings_price_history_df.drop_duplicates(
+                subset=["date", "ticker"],
+                keep="last",
+            ).reset_index(drop=True)
     latest_holdings_exposure_df, holdings_factor_contribution_df = _build_holdings_tables(
         holdings_snapshot_df=holdings_snapshot_df,
         universe_df=universe,
@@ -1793,7 +1977,7 @@ def build_factor_analytics_platform(
         "notes": notes,
     }
     _validate_analytics_payload(analytics)
-    return _store_factor_analytics_cache(cache_key, analytics)
+    return _finalize_factor_analytics_cache(cache_key, analytics)
 
 
 # Backward-compatible alias for older page imports.

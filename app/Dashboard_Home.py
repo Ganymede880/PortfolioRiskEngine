@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from src.analytics.ledger import apply_cash_ledger_entries_to_positions, apply_trades_to_positions
+from src.analytics.exposure import build_portfolio_return_history
 from src.analytics.performance import compute_sharpe_ratio, prepare_flow_adjusted_history
 from src.analytics.portfolio import build_current_portfolio_snapshot, summarize_by_team, summarize_total_portfolio
 from src.config.settings import settings
@@ -395,127 +396,12 @@ def get_home_snapshot_data() -> tuple[pd.DataFrame, pd.Timestamp | None, pd.Time
 
 @st.cache_data(ttl=settings.price_refresh_interval_seconds)
 def get_home_history() -> pd.DataFrame:
-    with session_scope() as session:
-        all_snapshots_df = load_all_portfolio_snapshots(session)
-        trades_df = load_trade_receipts(session)
-        cash_df = load_cash_ledger(session)
-
-    if all_snapshots_df.empty:
-        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow"])
-
-    df = all_snapshots_df.copy()
-    df["snapshot_date"] = pd.to_datetime(df["snapshot_date"], errors="coerce")
-    df[COL_TICKER] = df[COL_TICKER].astype(str).str.strip().str.upper()
-    df[COL_TEAM] = df[COL_TEAM].astype(str).str.strip()
-    df[COL_POSITION_SIDE] = df[COL_POSITION_SIDE].astype(str).str.strip().str.upper()
-    df[COL_SHARES] = pd.to_numeric(df[COL_SHARES], errors="coerce")
-    df = df.dropna(subset=["snapshot_date", COL_TICKER, COL_SHARES]).copy()
-    if df.empty:
-        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow"])
-
-    ticker_normalization = {"BRKB": "BRK-B", "BRKA": "BRK-A"}
-    df[COL_TICKER] = df[COL_TICKER].replace(ticker_normalization)
-
-    today = pd.Timestamp.today().normalize()
-    start_date = _determine_history_start_date(df["snapshot_date"].min(), today)
-    business_dates = pd.bdate_range(start=start_date, end=today)
-    if len(business_dates) == 0:
-        return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow"])
-
-    trades = trades_df.copy()
-    if not trades.empty:
-        trades["trade_date"] = pd.to_datetime(trades["trade_date"], errors="coerce")
-        trades[COL_TICKER] = trades[COL_TICKER].astype(str).str.strip().str.upper().replace(ticker_normalization)
-        trades = trades.dropna(subset=["trade_date", COL_TICKER]).copy()
-
-    external_cash = cash_df.copy()
-    if not external_cash.empty:
-        external_cash["activity_date"] = pd.to_datetime(external_cash["activity_date"], errors="coerce")
-        external_cash["activity_type"] = external_cash["activity_type"].astype(str).str.strip().str.upper()
-        external_cash["amount"] = pd.to_numeric(external_cash["amount"], errors="coerce").fillna(0.0)
-        external_cash = external_cash.loc[
-            external_cash["activity_type"].isin(EXTERNAL_FLOW_ACTIVITY_TYPES)
-        ].dropna(subset=["activity_date"]).copy()
-        if not external_cash.empty:
-            cash_dates = external_cash["activity_date"].dt.normalize()
-            aligned_idx = business_dates.searchsorted(cash_dates)
-            valid_mask = aligned_idx < len(business_dates)
-            external_cash = external_cash.loc[valid_mask].copy()
-            if not external_cash.empty:
-                external_cash["flow_date"] = business_dates.take(aligned_idx[valid_mask]).normalize()
-
-    equity_tickers = (
-        df[COL_TICKER]
-        .loc[~df[COL_TICKER].isin(["CASH", "EUR", "GBP", "NOGXX"])]
-        .dropna()
-        .unique()
-        .tolist()
+    history_df = build_portfolio_return_history(
+        lookback_days=MAX_RETURN_LOOKBACK_DAYS + RETURN_LOOKBACK_BUFFER_DAYS,
     )
-    trade_tickers = trades[COL_TICKER].dropna().unique().tolist() if not trades.empty else []
-    history_tickers = sorted(set(equity_tickers + trade_tickers))
-    raw_price_history = fetch_multiple_price_histories(
-        tickers=history_tickers,
-        lookback_days=(today - start_date).days + 30,
-    )
-    price_matrix = _build_price_matrix(raw_price_history, business_dates)
-
-    snapshot_by_date = {dt.normalize(): grp.copy() for dt, grp in df.groupby("snapshot_date")}
-    snapshot_dates_sorted = sorted(snapshot_by_date.keys())
-    trades_by_date = (
-        {dt.normalize(): grp.copy() for dt, grp in trades.groupby(trades["trade_date"].dt.normalize())}
-        if not trades.empty else {}
-    )
-    cash_by_date = (
-        {dt.normalize(): grp.copy() for dt, grp in external_cash.groupby("flow_date")}
-        if not external_cash.empty else {}
-    )
-
-    history_rows: list[dict[str, float | pd.Timestamp]] = []
-    active_positions_df: pd.DataFrame | None = None
-
-    for dt in business_dates:
-        price_map: dict[str, float] = {}
-        if dt in price_matrix.index and len(price_matrix.columns) > 0:
-            price_row = price_matrix.loc[dt]
-            price_map = {
-                str(ticker).strip().upper(): float(price_row[ticker])
-                for ticker in price_matrix.columns
-                if pd.notna(price_row[ticker])
-            }
-
-        snapshot_for_day = snapshot_by_date.get(dt.normalize())
-        if active_positions_df is None:
-            eligible_snapshot_dates = [d for d in snapshot_dates_sorted if d <= dt]
-            if not eligible_snapshot_dates:
-                continue
-            if snapshot_for_day is None:
-                active_positions_df = snapshot_by_date[eligible_snapshot_dates[-1]].copy()
-
-        active_positions_df, net_external_flow = _transition_positions_for_day(
-            active_positions_df=active_positions_df,
-            snapshot_for_day=snapshot_for_day,
-            trades_today=trades_by_date.get(dt.normalize()),
-            cash_today=cash_by_date.get(dt.normalize()),
-            price_map=price_map,
-        )
-        if active_positions_df is None:
-            continue
-
-        history_rows.append(
-            {
-                "date": dt,
-                "portfolio_aum": float(_apply_position_values(active_positions_df, price_map)),
-                "net_external_flow": net_external_flow,
-            }
-        )
-
-    history_df = pd.DataFrame(history_rows)
     if history_df.empty:
         return pd.DataFrame(columns=["date", "portfolio_aum", "net_external_flow"])
-
-    history_df = history_df.sort_values("date").reset_index(drop=True)
-    history_df["net_external_flow"] = pd.to_numeric(history_df["net_external_flow"], errors="coerce").fillna(0.0)
-    return history_df
+    return history_df[["date", "portfolio_aum", "net_external_flow"]].copy()
 
 
 def _prepare_portfolio_history(history_df: pd.DataFrame) -> pd.DataFrame:

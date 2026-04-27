@@ -17,7 +17,7 @@ from datetime import date, datetime
 from typing import Iterable, Optional
 
 import pandas as pd
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from src.db.models import (
@@ -29,6 +29,30 @@ from src.db.models import (
     TradeReceipt,
     UploadLog,
 )
+
+
+def get_portfolio_history_cache_signature(session: Session) -> dict[str, object]:
+    """
+    Return a lightweight signature for invalidating derived daily history caches.
+    """
+    snapshot_count, snapshot_max_created_at = session.execute(
+        select(func.count(PortfolioSnapshot.id), func.max(PortfolioSnapshot.created_at))
+    ).one()
+    trade_count, trade_max_created_at = session.execute(
+        select(func.count(TradeReceipt.id), func.max(TradeReceipt.created_at))
+    ).one()
+    cash_count, cash_max_created_at = session.execute(
+        select(func.count(CashLedger.id), func.max(CashLedger.created_at))
+    ).one()
+
+    return {
+        "snapshot_count": int(snapshot_count or 0),
+        "snapshot_max_created_at": snapshot_max_created_at.isoformat() if snapshot_max_created_at else "",
+        "trade_count": int(trade_count or 0),
+        "trade_max_created_at": trade_max_created_at.isoformat() if trade_max_created_at else "",
+        "cash_count": int(cash_count or 0),
+        "cash_max_created_at": cash_max_created_at.isoformat() if cash_max_created_at else "",
+    }
 
 
 # ============================================================================
@@ -314,8 +338,9 @@ def load_trade_receipts(
 
     stmt = stmt.order_by(
         TradeReceipt.trade_date.asc(),
-        TradeReceipt.team.asc(),
-        TradeReceipt.ticker.asc(),
+        TradeReceipt.settlement_date.asc(),
+        TradeReceipt.created_at.asc(),
+        TradeReceipt.id.asc(),
     )
 
     records = session.execute(stmt).scalars().all()

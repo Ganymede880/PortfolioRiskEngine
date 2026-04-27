@@ -51,7 +51,7 @@ def get_team_benchmark_spec(team: str) -> dict[str, Any]:
         weights.append(float(numeric_weight) if pd.notna(numeric_weight) and float(numeric_weight) > 0 else np.nan)
 
     valid_weights = [weight for weight in weights if pd.notna(weight) and float(weight) > 0]
-    if valid_weights:
+    if valid_weights and len(valid_weights) == len(raw_components):
         weight_sum = float(sum(valid_weights))
         normalized_weights = [
             (float(weight) / weight_sum) if pd.notna(weight) and float(weight) > 0 else 0.0
@@ -142,6 +142,11 @@ def build_team_benchmark_aum_frame(
     available_weight_totals = available_weights.sum(axis=1)
     composite_returns = composite_returns / available_weight_totals.where(available_weight_totals.gt(0))
 
+    pure_benchmark_returns = pd.to_numeric(composite_returns, errors="coerce").fillna(0.0)
+    result["benchmark_return_index"] = (
+        (1.0 + pure_benchmark_returns).cumprod() - 1.0
+    ).to_numpy()
+
     benchmark_aum = pd.Series(index=result.index, dtype="float64")
     benchmark_aum.iloc[0] = float(initial_value)
     if len(result.index) > 1:
@@ -154,13 +159,24 @@ def build_team_benchmark_aum_frame(
     result["benchmark_aum"] = benchmark_aum.values
 
     for ticker in component_tickers:
+        pure_component_returns = pd.to_numeric(component_returns[ticker], errors="coerce").fillna(0.0)
+        result[f"benchmark_component_{ticker}_return_index"] = (
+            (1.0 + pure_component_returns).cumprod() - 1.0
+        ).to_numpy()
+        component_weight = float(component_weight_map.get(ticker, 0.0))
+        if component_weight <= 0:
+            continue
         component_aum = pd.Series(index=result.index, dtype="float64")
-        component_aum.iloc[0] = float(initial_value)
+        component_initial_value = float(initial_value) * component_weight
+        component_aum.iloc[0] = component_initial_value
         if len(result.index) > 1:
             component_tail = build_flow_adjusted_benchmark_series(
                 benchmark_return_series=component_returns[ticker].iloc[1:],
-                external_flow_series=pd.to_numeric(external_flow_series, errors="coerce").fillna(0.0).iloc[1:],
-                initial_value=float(initial_value),
+                external_flow_series=(
+                    pd.to_numeric(external_flow_series, errors="coerce").fillna(0.0).iloc[1:]
+                    * component_weight
+                ),
+                initial_value=component_initial_value,
             )
             component_aum.iloc[1:] = component_tail.values
         result[f"benchmark_component_{ticker}_aum"] = component_aum.values

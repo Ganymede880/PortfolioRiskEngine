@@ -31,6 +31,7 @@ import pandas as pd
 # ============================================================================
 POSITION_KEY_COLS = ["team", "ticker", "position_side"]
 CASH_LIKE_TICKERS = {"CASH", "EUR", "GBP", "NOGXX"}
+POSITION_EPSILON = 1e-9
 
 TRADE_SIDE_TO_POSITION_SIDE = {
     "BUY": "LONG",
@@ -126,6 +127,7 @@ def _standardize_trade_frame(trades_df: pd.DataFrame) -> pd.DataFrame:
         )
 
     df = trades_df.copy()
+    df["_input_order"] = range(len(df))
 
     if "team" not in df.columns:
         df["team"] = pd.NA
@@ -141,13 +143,22 @@ def _standardize_trade_frame(trades_df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.NaT
         df[col] = pd.to_datetime(df[col], errors="coerce")
 
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+
     for col in ["quantity", "gross_price", "commission", "fees", "net_cash_amount"]:
         if col not in df.columns:
             df[col] = pd.NA
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna(subset=["team", "ticker", "trade_side", "quantity", "gross_price"]).copy()
-    df = df.sort_values(["trade_date", "settlement_date", "team", "ticker"]).reset_index(drop=True)
+    sort_columns = ["trade_date", "settlement_date"]
+    if "created_at" in df.columns:
+        sort_columns.append("created_at")
+    if "id" in df.columns:
+        sort_columns.append("id")
+    sort_columns.append("_input_order")
+    df = df.sort_values(sort_columns, kind="stable").reset_index(drop=True)
 
     return df
 
@@ -165,6 +176,44 @@ def _is_cash_like_position(team: str, ticker: str, position_side: str) -> bool:
         or team_clean == "CASH"
         or side_clean == "CASH"
     )
+
+
+def _current_position_shares(
+    positions_df: pd.DataFrame,
+    team: str,
+    ticker: str,
+    position_side: str,
+) -> float:
+    mask = (
+        positions_df["team"].astype(str).str.strip().eq(str(team).strip())
+        & positions_df["ticker"].astype(str).str.strip().eq(str(ticker).strip())
+        & positions_df["position_side"].astype(str).str.strip().str.upper().eq(str(position_side).strip().upper())
+    )
+    if not mask.any():
+        return 0.0
+    return float(pd.to_numeric(positions_df.loc[mask, "shares"], errors="coerce").fillna(0.0).sum())
+
+
+def _trade_can_apply_to_positions(
+    positions_df: pd.DataFrame,
+    trade_row: pd.Series,
+) -> bool:
+    trade_side = str(trade_row["trade_side"]).strip().upper()
+    if trade_side in {"BUY", "SHORT_SELL"}:
+        return True
+
+    position_side = TRADE_SIDE_TO_POSITION_SIDE.get(trade_side)
+    if position_side is None:
+        return False
+
+    current_shares = _current_position_shares(
+        positions_df=positions_df,
+        team=str(trade_row["team"]).strip(),
+        ticker=str(trade_row["ticker"]).strip(),
+        position_side=position_side,
+    )
+    quantity = float(pd.to_numeric(pd.Series([trade_row["quantity"]]), errors="coerce").fillna(0.0).iloc[0])
+    return quantity <= (current_shares + POSITION_EPSILON)
 
 
 def _ensure_cash_position(
@@ -344,7 +393,7 @@ def apply_single_trade_to_positions(
         df.at[idx, "cost_basis_per_share"] = (new_total_cost / new_shares) if new_shares != 0 else pd.NA
 
     elif trade_side in {"SELL", "COVER"}:
-        if quantity > current_shares:
+        if quantity > (current_shares + POSITION_EPSILON):
             raise ValueError(
                 f"Trade would make position negative for {team}-{ticker}-{position_side}. "
                 f"Current shares={current_shares}, trade quantity={quantity}."
@@ -354,7 +403,7 @@ def apply_single_trade_to_positions(
             float(current_total_cost / current_shares) if current_shares != 0 else 0.0
         )
 
-        new_shares = current_shares - quantity
+        new_shares = max(current_shares - quantity, 0.0)
         new_total_cost = current_total_cost - (quantity * current_cost_per_share)
 
         df.at[idx, "shares"] = new_shares
@@ -408,9 +457,26 @@ def apply_trades_to_positions(
             "reference_type", "reference_id", "note"
         ])
 
-    for _, trade_row in trades.iterrows():
-        positions, cash_entry = apply_single_trade_to_positions(positions, trade_row)
-        cash_entries.append(cash_entry)
+    for _, trades_for_day in trades.groupby(trades["trade_date"].dt.normalize(), sort=False):
+        pending_rows = [trade_row for _, trade_row in trades_for_day.iterrows()]
+
+        while pending_rows:
+            next_pending: List[pd.Series] = []
+            progress_made = False
+
+            for trade_row in pending_rows:
+                if _trade_can_apply_to_positions(positions, trade_row):
+                    positions, cash_entry = apply_single_trade_to_positions(positions, trade_row)
+                    cash_entries.append(cash_entry)
+                    progress_made = True
+                else:
+                    next_pending.append(trade_row)
+
+            if not progress_made:
+                # Preserve the original validation error when no same-day ordering can resolve it.
+                apply_single_trade_to_positions(positions, next_pending[0])
+
+            pending_rows = next_pending
 
     return positions.reset_index(drop=True), pd.DataFrame(cash_entries)
 

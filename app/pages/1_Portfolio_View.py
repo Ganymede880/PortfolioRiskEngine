@@ -795,9 +795,9 @@ def _compute_one_year_portfolio_turnover(history_df: pd.DataFrame) -> float | No
 
     Replaced position value is approximated from authoritative snapshot changes:
     for each snapshot transition in the trailing year, compare investable
-    position keys and count the smaller of:
-    - market value of positions removed
-    - market value of positions added
+    position sizes and count the smaller of:
+    - market value of share increases
+    - market value of share decreases
     """
     if history_df.empty or "date" not in history_df.columns or "portfolio_aum" not in history_df.columns:
         return None
@@ -866,6 +866,7 @@ def _compute_one_year_portfolio_turnover(history_df: pd.DataFrame) -> float | No
     }
 
     replaced_value = 0.0
+    key_cols = [COL_TEAM, COL_TICKER, COL_POSITION_SIDE]
 
     for current_date in transition_dates:
         prior_dates = [dt for dt in snapshot_dates if dt < current_date]
@@ -878,45 +879,40 @@ def _compute_one_year_portfolio_turnover(history_df: pd.DataFrame) -> float | No
         if previous_df.empty or current_df.empty:
             continue
 
-        key_cols = [COL_TEAM, COL_TICKER, COL_POSITION_SIDE]
-        previous_keys = set(map(tuple, previous_df[key_cols].itertuples(index=False, name=None)))
-        current_keys = set(map(tuple, current_df[key_cols].itertuples(index=False, name=None)))
-
-        removed_keys = previous_keys - current_keys
-        added_keys = current_keys - previous_keys
-
-        if not removed_keys and not added_keys:
+        merged = previous_df[key_cols + [COL_SHARES]].merge(
+            current_df[key_cols + [COL_SHARES]],
+            on=key_cols,
+            how="outer",
+            suffixes=("_prev", "_cur"),
+        )
+        merged["shares_prev"] = pd.to_numeric(merged["shares_prev"], errors="coerce").fillna(0.0)
+        merged["shares_cur"] = pd.to_numeric(merged["shares_cur"], errors="coerce").fillna(0.0)
+        merged["delta_shares"] = merged["shares_cur"] - merged["shares_prev"]
+        merged = merged.loc[merged["delta_shares"].abs() > 1e-9].copy()
+        if merged.empty:
             continue
 
-        removed_df = previous_df.loc[
-            previous_df[key_cols].apply(tuple, axis=1).isin(removed_keys)
-        ].copy()
-        added_df = current_df.loc[
-            current_df[key_cols].apply(tuple, axis=1).isin(added_keys)
-        ].copy()
-
-        previous_price_map: dict[str, float] = {}
-        current_price_map: dict[str, float] = {}
-
-        if previous_date in price_matrix.index and len(price_matrix.columns) > 0:
-            previous_row = price_matrix.loc[previous_date]
-            previous_price_map = {
-                str(ticker).strip().upper(): float(previous_row[ticker])
-                for ticker in price_matrix.columns
-                if pd.notna(previous_row[ticker])
-            }
-
+        valuation_row = None
         if current_date in price_matrix.index and len(price_matrix.columns) > 0:
-            current_row = price_matrix.loc[current_date]
-            current_price_map = {
-                str(ticker).strip().upper(): float(current_row[ticker])
-                for ticker in price_matrix.columns
-                if pd.notna(current_row[ticker])
-            }
+            valuation_row = price_matrix.loc[current_date]
+        elif previous_date in price_matrix.index and len(price_matrix.columns) > 0:
+            valuation_row = price_matrix.loc[previous_date]
+        if valuation_row is None:
+            continue
 
-        removed_value = abs(_apply_position_values(removed_df, previous_price_map))
-        added_value = abs(_apply_position_values(added_df, current_price_map))
-        replaced_value += min(removed_value, added_value)
+        buy_value = 0.0
+        sell_value = 0.0
+        for _, pos in merged.iterrows():
+            px = valuation_row.get(str(pos[COL_TICKER]).strip().upper())
+            if pd.isna(px):
+                continue
+            delta_value = float(pos["delta_shares"]) * float(px)
+            if delta_value > 0:
+                buy_value += delta_value
+            elif delta_value < 0:
+                sell_value += abs(delta_value)
+
+        replaced_value += min(buy_value, sell_value)
 
     return (replaced_value / average_aum) * 100.0
 
